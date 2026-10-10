@@ -11,7 +11,7 @@ async function digest(text) {
 }
 async function passwordHash(password, salt) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: encoder.encode(salt), iterations: 210000, hash: "SHA-256" }, key, 256);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: encoder.encode(salt), iterations: 100000, hash: "SHA-256" }, key, 256);
   return hex(bits);
 }
 function corsHeaders(request) {
@@ -77,7 +77,7 @@ async function route(request, env) {
       ]);
       await audit(env, { id: userId }, "customer_registered", "user", userId);
       return response({ ok: true, message: "Account created. Please log in." }, 201, request);
-  } catch (e) {
+ } catch (e) {
   console.error("Registration error:", e);
   return response({ error: "Registration failed. Check Worker logs." }, 500, request);
 }
@@ -210,6 +210,7 @@ async function route(request, env) {
   }
   return response({error:"API route not found."},404,request);
 }
+
 export default {
   async fetch(request, env) {
     try { return await route(request, env); }
