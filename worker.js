@@ -65,7 +65,7 @@ async function route(request, env) {
     const d = await body(request);
     const username = String(d.username || "").trim().toLowerCase(), displayName = String(d.displayName || "").trim();
     const email = String(d.email || "").trim().toLowerCase(), password = String(d.password || "");
-    if (!/^[a-z0-9_]{3,24}$/.test(username) || displayName.length < 2 || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) || password.length < 10)
+    if (!/^[a-z0-9_]{3,24}$/.test(username) || displayName.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10)
       return response({ error: "Enter a 3–24 character username, name, valid email and password of at least 10 characters." }, 400, request);
     const salt = uid(), userId = uid(), accountId = uid();
     try {
