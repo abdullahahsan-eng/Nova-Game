@@ -77,7 +77,7 @@ async function route(request, env) {
       ]);
       await audit(env, { id: userId }, "customer_registered", "user", userId);
       return response({ ok: true, message: "Account created. Please log in." }, 201, request);
- } catch (e) {
+  } catch (e) {
   console.error("Registration error:", e);
   return response({ error: "Registration failed. Check Worker logs." }, 500, request);
 }
@@ -209,6 +209,7 @@ async function route(request, env) {
     return response({events:rows.results||[]},200,request);
   }
   return response({error:"API route not found."},404,request);
+}
 export default {
   async fetch(request, env) {
     try { return await route(request, env); }
