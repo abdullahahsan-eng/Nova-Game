@@ -77,7 +77,7 @@ async function route(request, env) {
       ]);
       await audit(env, { id: userId }, "customer_registered", "user", userId);
       return response({ ok: true, message: "Account created. Please log in." }, 201, request);
-  } catch (e) {
+ } catch (e) {
   console.error("Registration error:", e);
   return response({ error: "Registration failed. Check Worker logs." }, 500, request);
 }
