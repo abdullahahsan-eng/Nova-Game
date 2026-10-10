@@ -77,9 +77,11 @@ async function route(request, env) {
       ]);
       await audit(env, { id: userId }, "customer_registered", "user", userId);
       return response({ ok: true, message: "Account created. Please log in." }, 201, request);
-    } catch (e) { return response({ error: "Username/email may already be registered." }, 409, request); }
-  }
-
+  } catch (e) {
+  console.error("Registration error:", e);
+  return response({ error: "Registration failed. Check Worker logs." }, 500, request);
+}
+    
   if (method === "POST" && path === "/api/login") {
     const d = await body(request), login = String(d.login || "").trim().toLowerCase();
     const user = await env.DB.prepare("SELECT * FROM users WHERE username=? OR email=?").bind(login, login).first();
