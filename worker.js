@@ -209,7 +209,6 @@ async function route(request, env) {
     return response({events:rows.results||[]},200,request);
   }
   return response({error:"API route not found."},404,request);
-  
 export default {
   async fetch(request, env) {
     try { return await route(request, env); }
