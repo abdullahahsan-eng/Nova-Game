@@ -81,7 +81,8 @@ async function route(request, env) {
   console.error("Registration error:", e);
   return response({ error: "Registration failed. Check Worker logs." }, 500, request);
 }
-    
+  }
+
   if (method === "POST" && path === "/api/login") {
     const d = await body(request), login = String(d.login || "").trim().toLowerCase();
     const user = await env.DB.prepare("SELECT * FROM users WHERE username=? OR email=?").bind(login, login).first();
