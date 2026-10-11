@@ -246,6 +246,80 @@ async function route(request, env) {
     const rows = user.role === "admin" ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
+  if (method === "GET" && path === "/api/products") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
+      id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+      user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL,
+      tenure_months INTEGER NOT NULL, remaining_months INTEGER NOT NULL,
+      monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const loans = user.role === "admin"
+      ? await env.DB.prepare("SELECT * FROM demo_loans ORDER BY created_at DESC LIMIT 500").all()
+      : await env.DB.prepare("SELECT * FROM demo_loans WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    const cards = user.role === "admin"
+      ? await env.DB.prepare("SELECT * FROM virtual_cards ORDER BY created_at DESC LIMIT 500").all()
+      : await env.DB.prepare("SELECT * FROM virtual_cards WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    return response({ loans: loans.results || [], cards: cards.results || [] }, 200, request);
+  }
+
+  const acceptLoanMatch = path.match(/^\/api\/loans\/([^/]+)\/accept$/);
+  if (method === "POST" && acceptLoanMatch) {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
+      id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+      user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL,
+      tenure_months INTEGER NOT NULL, remaining_months INTEGER NOT NULL,
+      monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const loan = await env.DB.prepare("SELECT * FROM loan_applications WHERE id=? AND user_id=?").bind(acceptLoanMatch[1], user.id).first();
+    if (!loan) return response({ error: "Loan application not found." }, 404, request);
+    if (loan.status !== "approved" || !loan.sanctioned_amount || loan.sanctioned_amount <= 0) return response({ error: "Only an approved loan with a sanctioned amount can be accepted." }, 400, request);
+    const exists = await env.DB.prepare("SELECT id FROM demo_loans WHERE application_id=?").bind(loan.id).first();
+    if (exists) return response({ error: "This demo loan has already been activated." }, 409, request);
+    const account = await env.DB.prepare("SELECT * FROM accounts WHERE user_id=? AND status='active' ORDER BY opened_at LIMIT 1").bind(user.id).first();
+    if (!account) return response({ error: "No active demo account is available." }, 400, request);
+    const id=uid(), amount=Number(loan.sanctioned_amount), tenure=Number(loan.tenure_months), monthly=Math.ceil(amount/tenure), group=uid();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO demo_loans(id,application_id,user_id,account_id,principal_amount,outstanding_amount,tenure_months,remaining_months,monthly_payment,status) VALUES(?,?,?,?,?,?,?,?,?,'active')").bind(id,loan.id,user.id,account.id,amount,amount,tenure,tenure,monthly),
+      env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=?").bind(amount,account.id,user.id),
+      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"loan_disbursement",amount,Number(account.balance)+amount,"Demo loan disbursement"),
+      env.DB.prepare("UPDATE loan_applications SET status='disbursed',updated_at=datetime('now') WHERE id=? AND user_id=? AND status='approved'").bind(loan.id,user.id)
+    ]);
+    await notify(env,user.id,"Demo loan activated",`N₹${(amount/100).toFixed(2)} demo loan added to your demo account. Monthly demo EMI: N₹${(monthly/100).toFixed(2)}.`);
+    await audit(env,user,"demo_loan_disbursed","demo_loan",id,{applicationId:loan.id,amount,tenure});
+    return response({ok:true,message:"Demo loan accepted and disbursed to your fictional account."},200,request);
+  }
+
+  const repayLoanMatch = path.match(/^\/api\/loans\/([^/]+)\/repay$/);
+  if (method === "POST" && repayLoanMatch) {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
+      id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+      user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL,
+      tenure_months INTEGER NOT NULL, remaining_months INTEGER NOT NULL,
+      monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='active'").bind(repayLoanMatch[1],user.id).first();
+    if(!loan) return response({error:"Active demo loan not found."},404,request);
+    const account=await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(loan.account_id,user.id).first();
+    if(!account) return response({error:"No active account is available for repayment."},400,request);
+    const amount=Math.min(Number(loan.monthly_payment),Number(loan.outstanding_amount));
+    if(Number(account.balance)<amount) return response({error:`Insufficient demo balance. Your next demo EMI is N₹${(amount/100).toFixed(2)}.`},400,request);
+    const outstanding=Math.max(0,Number(loan.outstanding_amount)-amount), remaining=outstanding===0?0:Math.max(0,Number(loan.remaining_months)-1), status=outstanding===0?"closed":"active", group=uid();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND balance>=?").bind(amount,account.id,user.id,amount),
+      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"loan_repayment",amount,Number(account.balance)-amount,"Demo loan EMI repayment"),
+      env.DB.prepare("UPDATE demo_loans SET outstanding_amount=?,remaining_months=?,status=?,updated_at=datetime('now') WHERE id=? AND user_id=?").bind(outstanding,remaining,status,loan.id,user.id),
+      ...(outstanding===0?[env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=?").bind(loan.application_id,user.id)]:[])
+    ]);
+    await notify(env,user.id,"Demo EMI recorded",`Your demo EMI payment of N₹${(amount/100).toFixed(2)} was recorded. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`);
+    await audit(env,user,"demo_loan_repayment","demo_loan",loan.id,{amount,outstanding,remaining});
+    return response({ok:true,message:`Demo EMI paid. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`},200,request);
+  }
   if (method === "POST" && path.startsWith("/api/admin/")) {
     if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
     const d = await body(request);
@@ -271,6 +345,11 @@ async function route(request, env) {
       if(!card) return response({error:"Application not found."},404,request);
       if(status==="approved"&&(!Number.isSafeInteger(amount)||amount<100||amount>card.requested_limit)) return response({error:"Approved limit must be positive and not exceed requested limit."},400,request);
       await env.DB.prepare("UPDATE card_applications SET status=?,sanctioned_limit=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status,amount,String(d.note||""),card.id).run();
+      if(status==="approved") {
+        const finalLimit = Number(amount);
+        const suffix = String(card.id).replace(/[^a-z0-9]/gi,"").slice(-4).toUpperCase().padStart(4,"0");
+        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status) VALUES(?,?,?,?,0,'active') ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit,status='active'").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit).run();
+      }
       await notify(env,card.user_id,"Virtual card application update",`Your demo card application status is now: ${status}. ${String(d.note||"")}`);
       await audit(env,user,"card_review","card_application",card.id,{status,amount,note:d.note||""});
       return response({ok:true},200,request);
