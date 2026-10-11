@@ -196,6 +196,35 @@ async function route(request, env) {
     const rows = await q.all();
     return response({ transactions: rows.results || [] }, 200, request);
   }
+  // Demo deposits and withdrawals only. Amounts are stored as integer cents.
+  if (method === "POST" && (path === "/api/deposit" || path === "/api/withdraw")) {
+    const d = await body(request);
+    const amount = Math.round(Number(d.amount) * 100);
+    const isDeposit = path === "/api/deposit";
+    if (!Number.isSafeInteger(amount) || amount < 100 || amount > 100000000) {
+      return response({ error: "Amount must be between N₹1 and N₹1,000,000." }, 400, request);
+    }
+    const account = await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(String(d.accountId||""), user.id).first();
+    if (!account) return response({ error: "Active demo account not found." }, 404, request);
+    if (!isDeposit && Number(account.balance) < amount) return response({ error: "Insufficient demo balance for this withdrawal." }, 400, request);
+    const group = uid(), ledgerId = uid();
+    const nextBalance = isDeposit ? Number(account.balance) + amount : Number(account.balance) - amount;
+    const description = String(d.description || (isDeposit ? "Demo deposit" : "Demo withdrawal")).trim().slice(0,100) || (isDeposit ? "Demo deposit" : "Demo withdrawal");
+    const updateSql = isDeposit
+      ? "UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=? AND status='active'"
+      : "UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND status='active' AND balance>=?";
+    const update = isDeposit
+      ? env.DB.prepare(updateSql).bind(amount, account.id, user.id)
+      : env.DB.prepare(updateSql).bind(amount, account.id, user.id, amount);
+    const insert = env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) SELECT ?,id,?,?,?,?,? FROM accounts WHERE id=? AND user_id=? AND balance=? AND changes()>0")
+      .bind(ledgerId, group, isDeposit ? "deposit" : "withdrawal", amount, nextBalance, description, account.id, user.id, nextBalance);
+    const results = await env.DB.batch([update, insert]);
+    if (!results?.[0]?.meta?.changes) return response({ error: isDeposit ? "Deposit could not be recorded. Refresh and try again." : "Insufficient demo balance or withdrawal could not be recorded." }, 400, request);
+    await audit(env, user, isDeposit ? "demo_deposit" : "demo_withdrawal", "transaction", group, { accountId: account.id, amount, description });
+    await notify(env, user.id, isDeposit ? "Demo deposit recorded" : "Demo withdrawal recorded", `N₹${(amount/100).toFixed(2)} demo ${isDeposit?"deposit":"withdrawal"} recorded. New demo balance: N₹${(nextBalance/100).toFixed(2)}.`);
+    return response({ ok: true, transactionId: group, message: `${isDeposit ? "Demo deposit" : "Demo withdrawal"} recorded. New balance: N₹${(nextBalance/100).toFixed(2)}.` }, 200, request);
+  }
+
   if (method === "POST" && path === "/api/transfer") {
     const d = await body(request), amount = Math.round(Number(d.amount) * 100);
     if (!Number.isSafeInteger(amount) || amount < 100 || amount > 100000000) return response({ error: "Transfer amount must be between N₹1 and N₹1,000,000." }, 400, request);
