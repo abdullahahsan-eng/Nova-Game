@@ -104,6 +104,33 @@ async function route(request, env) {
   if (!user) return response({ error: "Please log in." }, 401, request);
   if (method === "GET" && path === "/api/me") return response({ user }, 200, request);
 
+  // Super Admin: list customers and their demo accounts.
+  if (method === "GET" && path === "/api/admin/customers") {
+    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    const q = String(url.searchParams.get("q") || "").trim().slice(0,100);
+    const like = `%${q.replace(/[\%_]/g, "\\$&")}%`;
+    const rows = await env.DB.prepare(`SELECT u.id AS user_id,u.username,u.display_name,u.email,u.role AS user_role,u.status AS user_status,u.created_at AS customer_since,
+      a.id AS account_id,a.account_number,a.account_type,a.status AS account_status,a.balance,a.opened_at
+      FROM users u LEFT JOIN accounts a ON a.user_id=u.id
+      WHERE u.role!='admin' AND (?='' OR u.username LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\' OR a.account_number LIKE ? ESCAPE '\\')
+      ORDER BY u.created_at DESC LIMIT 250`).bind(q,like,like,like,like).all();
+    return response({ customers: rows.results || [] }, 200, request);
+  }
+  const accountStatusMatch = path.match(/^\/api\/admin\/accounts\/([^/]+)\/status$/);
+  if (accountStatusMatch && method === "POST") {
+    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    const d = await body(request), status = String(d.status || "");
+    if (!['active','frozen'].includes(status)) return response({ error: "Choose active or frozen." }, 400, request);
+    const account = await env.DB.prepare("SELECT a.*,u.id AS owner_id,u.display_name,u.username FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.id=?").bind(accountStatusMatch[1]).first();
+    if (!account) return response({ error: "Account not found." }, 404, request);
+    if (account.status === status) return response({ ok:true, status, message:`Account is already ${status}.` }, 200, request);
+    const note = String(d.note || "").trim().slice(0,250);
+    await env.DB.prepare("UPDATE accounts SET status=? WHERE id=?").bind(status, account.id).run();
+    await audit(env,user,status==='frozen'?'account_frozen':'account_unfrozen','account',account.id,{accountNumber:account.account_number,ownerId:account.owner_id,note,previousStatus:account.status,newStatus:status});
+    await notify(env,account.owner_id,status==='frozen'?'Demo account frozen':'Demo account reactivated',`Your NovaBank demo account ${account.account_number} is now ${status}. ${note}`.trim());
+    return response({ ok:true,status,message:`Account ${status==='frozen'?'frozen':'unfrozen'} successfully.` },200,request);
+  }
+
   // Offers are fictional simulator content, managed by admins in the dashboard.
   if (path === "/api/offers" && method === "GET") {
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS offers (
