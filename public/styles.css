@@ -52,3 +52,6 @@ body.modal-open{overflow:hidden}
 
 /* Admin-reviewed deposit and withdrawal requests */
 .money-request-manager{margin-top:26px;padding-top:22px;border-top:1px solid #ffffff18}.money-review-card{padding:14px;border:1px solid var(--line);border-radius:12px;background:#0a1926;margin:10px 0}.money-review-card label{margin:10px 0}.money-review-card .review-controls .btn{width:auto;flex:1}.money-request-item{flex-wrap:wrap}.status-pending{background:#3b3423;color:#ffe4a3}.status-approved{background:#10372f;color:#8fffd3}.status-rejected{background:#3b2025;color:#ffd1d1}.status-processing{background:#1e3046;color:#b8d9ff}
+
+/* Admin customer management */
+.customer-search-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;margin:12px 0}.customer-search-row input{margin:0}.admin-customer-card{border:1px solid var(--line);background:#0a1a28;border-radius:12px;padding:12px;margin:8px 0}.customer-action-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end;margin-top:8px}.customer-action-row label{margin:0}.customer-action-row button{white-space:nowrap}.status-rejected{background:#46262b;color:#ffc3c3}.status-active{background:#10372f;color:var(--green)}@media(max-width:600px){.customer-search-row,.customer-action-row{grid-template-columns:1fr}.customer-action-row button{width:100%}}
