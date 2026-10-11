@@ -1,43 +1,23 @@
-# NovaBank — Full Banking Simulator (Phase 1 foundation)
+NovaBank Super Admin Portal v6
+================================
+Files:
+- worker.js: based on the uploaded worker(4).js, with setup-admin bootstrap route removed, customer detail endpoint added, and one-time demo loan foreclosure endpoint added.
+- public/admin.html, public/admin.js, public/admin.css: dedicated Super Admin portal at /admin.html.
+- schema.sql: not changed; the Worker creates demo_loans table if missing.
 
-A fictional, educational banking simulator. It does **not** connect to real banks, UPI, card networks, payment gateways, or credit bureaus. All balances are demo-only Nova Rupees (N₹).
+Deploy notes:
+1. Back up the currently deployed worker.js and public assets.
+2. Replace root worker.js with this worker.js.
+3. Add public/admin.html, public/admin.js, public/admin.css to the same assets directory as the current public/index.html.
+4. Preserve wrangler.toml, D1 binding DB, ASSETS binding and all existing customer data.
+5. Deploy to Cloudflare.
+6. After deploy, delete ADMIN_SETUP_KEY from Production variables/secrets; this worker no longer exposes /api/setup-admin.
+7. Open https://YOUR-WORKER/admin.html and sign in with the created admin account.
 
-## Included in this package
-- Responsive PWA-ready interface
-- Cloudflare Worker API foundation
-- Cloudflare D1 schema for users, accounts, sessions, ledger, loan applications, virtual-card applications, notifications, and audit events
-- Password hashing using Web Crypto PBKDF2
-- Register/login/logout and authenticated profile endpoints
-- Account/transaction listing
-- Demo loan and virtual-card application endpoints
-- Admin-only review endpoints and admin bootstrap protected by a setup secret
-- Transfer endpoint with basic balance checks and a D1 batch ledger pattern
-
-## Important
-This is a **Phase 1 development foundation**, not a finished production banking product. Before public use, the remaining workflows must be completed and tested: secure concurrent transfers/atomic ledger guarantees, document upload to private object storage, account recovery, rate limits, comprehensive role/permission checks, loan amortization, credit-card billing, recurring salary jobs, Central Bank controls, accessibility, and security testing. Do not store real identity documents or real financial data.
-
-## Deploy (Cloudflare)
-1. Create a GitHub repository and upload these files.
-2. In Cloudflare, create a D1 database named `novabank-db`.
-3. Copy the database ID into `wrangler.toml`.
-4. Run `npx wrangler d1 execute novabank-db --remote --file=schema.sql`.
-5. Set secrets:
-   - `npx wrangler secret put SESSION_SECRET`
-   - `npx wrangler secret put ADMIN_SETUP_KEY`
-6. Install Wrangler and deploy with `npx wrangler deploy`.
-7. Open the deployed Worker URL. The static assets are served from `public/` using the assets binding in `wrangler.toml`.
-8. Bootstrap the first admin by sending a POST request to `/api/setup-admin` with JSON `{ "setupKey":"YOUR_ADMIN_SETUP_KEY", "username":"admin", "password":"a-strong-demo-password" }`. Remove/disable this endpoint after the admin is created.
-
-## Local preview
-Open `public/index.html` directly for the UI preview. API actions require deployment to Cloudflare. The UI is designed to show a clear connection status when the API is unavailable.
-
-## Currency and roles
-- Currency: N₹ (fictional only)
-- Roles: customer and admin in this phase. The schema is ready for expansion to branch manager, loan officer, credit officer, cashier, and auditor.
-
-
-## Offers for You feature
-- The Worker creates the `offers` table if it is missing and seeds three fictional offers on first read.
-- Signed-in customers see active offers. Admin users can create offers and activate/deactivate them.
-- Run `schema.sql` only if you are initializing a fresh D1 database; the Worker can create the offers table itself.
-- Offers are fictional simulator content, not real financial products.
+Important behavior:
+- Admin portal requires authenticated user.role === 'admin'; APIs enforce this server-side.
+- Customer search supports name, username, email and account number.
+- Account freeze/unfreeze requires a reason and uses existing admin API.
+- Full one-time foreclosure deducts the complete outstanding amount from the customer's linked active demo account. It fails if the account has insufficient demo balance; it does not waive/write off debt.
+- All amounts are fictional Nova Rupees; no real banking or payments.
+- Validate in a test customer account before relying on it. Review the current production worker against this bundle before deploying if there have been changes after worker(4).js.

@@ -48,18 +48,7 @@ async function route(request, env) {
   if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
   if (method === "GET" && path === "/api/health") return response({ ok: true, app: "NovaBank", mode: "fictional-simulator" }, 200, request);
 
-  if (method === "POST" && path === "/api/setup-admin") {
-    const data = await body(request);
-    if (!env.ADMIN_SETUP_KEY || data.setupKey !== env.ADMIN_SETUP_KEY) return response({ error: "Invalid setup key" }, 403, request);
-    const exists = await env.DB.prepare("SELECT id FROM users WHERE role='admin' LIMIT 1").first();
-    if (exists) return response({ error: "Admin already exists; disable setup endpoint now." }, 409, request);
-    if (!data.username || !data.password || String(data.password).length < 12 || !data.email || !data.displayName) return response({ error: "Provide username, displayName, email and a password of at least 12 characters." }, 400, request);
-    const salt = uid(), id = uid(), hash = await passwordHash(data.password, salt);
-    await env.DB.prepare("INSERT INTO users(id,username,display_name,email,password_hash,password_salt,role) VALUES(?,?,?,?,?,?,'admin')")
-      .bind(id, data.username.toLowerCase(), data.displayName, data.email.toLowerCase(), hash, salt).run();
-    await audit(env, { id }, "admin_bootstrap", "user", id);
-    return response({ ok: true, message: "Admin created. Disable setup endpoint/secret after confirming login." }, 201, request);
-  }
+  // Admin bootstrap endpoint removed after initial Super Admin creation.
 
   if (method === "POST" && path === "/api/register") {
     const d = await body(request);
@@ -116,6 +105,32 @@ async function route(request, env) {
       ORDER BY u.created_at DESC LIMIT 250`).bind(q,like,like,like,like).all();
     return response({ customers: rows.results || [] }, 200, request);
   }
+
+  if (method === "GET" && path === "/api/admin/customer-details") {
+    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    const customerId = String(url.searchParams.get("userId") || "").trim();
+    if (!customerId) return response({ error: "Customer ID is required." }, 400, request);
+    const customer = await env.DB.prepare("SELECT id,username,display_name,email,role,status,created_at FROM users WHERE id=? AND role!='admin'").bind(customerId).first();
+    if (!customer) return response({ error: "Customer not found." }, 404, request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
+      id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+      user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL,
+      tenure_months INTEGER NOT NULL, remaining_months INTEGER NOT NULL,
+      monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const [accounts, loans, cards, loanApps, cardApps, tx] = await Promise.all([
+      env.DB.prepare("SELECT * FROM accounts WHERE user_id=? ORDER BY opened_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT * FROM demo_loans WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT * FROM virtual_cards WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT id,requested_amount,tenure_months,sanctioned_amount,status,admin_note,created_at,updated_at FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT id,requested_limit,sanctioned_limit,status,admin_note,created_at,updated_at FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT l.* FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.user_id=? ORDER BY l.created_at DESC LIMIT 50").bind(customerId).all()
+    ]);
+    return response({ customer, accounts:accounts.results||[], loans:loans.results||[], cards:cards.results||[], loanApplications:loanApps.results||[], cardApplications:cardApps.results||[], transactions:tx.results||[] },200,request);
+  }
+
   const accountStatusMatch = path.match(/^\/api\/admin\/accounts\/([^/]+)\/status$/);
   if (accountStatusMatch && method === "POST") {
     if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
@@ -448,6 +463,30 @@ async function route(request, env) {
   if (method === "POST" && path.startsWith("/api/admin/")) {
     if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
     const d = await body(request);
+
+    const foreclosureMatch = path.match(/^\/api\/admin\/loans\/([^/]+)\/foreclose$/);
+    if (foreclosureMatch) {
+      const loan = await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND status='active'").bind(foreclosureMatch[1]).first();
+      if (!loan) return response({ error: "Active demo loan not found." }, 404, request);
+      const account = await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(loan.account_id,loan.user_id).first();
+      if (!account) return response({ error: "Customer's linked account is not active." }, 400, request);
+      const amount = Number(loan.outstanding_amount);
+      if (!Number.isSafeInteger(amount) || amount <= 0) return response({ error: "Loan has no outstanding amount to foreclose." }, 400, request);
+      if (Number(account.balance) < amount) return response({ error: `Insufficient demo balance. Full one-time foreclosure requires N₹${(amount/100).toFixed(2)}.` }, 400, request);
+      const group = uid(), ledgerId = uid(), before = Number(account.balance), after = before - amount;
+      const results = await env.DB.batch([
+        env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND status='active' AND balance>=?").bind(amount,account.id,loan.user_id,amount),
+        env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM accounts WHERE id=? AND balance=?)").bind(ledgerId,account.id,group,"loan_foreclosure",amount,after,`One-time full loan foreclosure · ${loan.id}`,account.id,after),
+        env.DB.prepare("UPDATE demo_loans SET outstanding_amount=0,remaining_months=0,status='closed',updated_at=datetime('now') WHERE id=? AND status='active' AND outstanding_amount=? AND EXISTS(SELECT 1 FROM ledger WHERE id=? AND transaction_group=?)").bind(loan.id,amount,ledgerId,group),
+        env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=? AND EXISTS(SELECT 1 FROM demo_loans WHERE id=? AND status='closed')").bind(loan.application_id,loan.user_id,loan.id)
+      ]);
+      const changed=Number(results?.[0]?.meta?.changes||0), ledgerChanged=Number(results?.[1]?.meta?.changes||0), closed=Number(results?.[2]?.meta?.changes||0);
+      if(!changed || !ledgerChanged || !closed) return response({ error:"Foreclosure could not be completed safely. Refresh the record and retry." },409,request);
+      await notify(env,loan.user_id,"Demo loan foreclosed",`Your demo loan ${loan.id} was fully paid through a one-time foreclosure payment of N₹${(amount/100).toFixed(2)}. Remaining balance is N₹0.00.`);
+      await audit(env,user,"demo_loan_foreclosed","demo_loan",loan.id,{amount,accountId:account.id,transactionGroup:group,oneTimePayment:true});
+      return response({ok:true,message:`Loan foreclosed with one-time demo payment of N₹${(amount/100).toFixed(2)}.`,paidAmount:amount/100,remainingOutstanding:0},200,request);
+    }
+
     const loanMatch = path.match(/^\/api\/admin\/loans\/([^/]+)\/review$/);
     if (loanMatch) {
       const status=String(d.status||""), allowed=["need_documents","verified","approved","rejected"];

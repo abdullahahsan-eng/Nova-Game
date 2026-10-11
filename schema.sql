@@ -103,17 +103,3 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_date ON audit_events(created_at DESC);
-
-CREATE TABLE IF NOT EXISTS offers (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  category TEXT NOT NULL,
-  description TEXT NOT NULL,
-  benefit TEXT NOT NULL DEFAULT '',
-  cta_label TEXT NOT NULL DEFAULT 'Explore offer',
-  active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-  valid_until TEXT NOT NULL DEFAULT '',
-  created_by TEXT REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
