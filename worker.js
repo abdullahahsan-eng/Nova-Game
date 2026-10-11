@@ -94,6 +94,38 @@ async function route(request, env) {
   if (method === "GET" && path === "/api/me") return response({ user }, 200, request);
 
   // Super Admin: list customers and their demo accounts.
+  if (method === "GET" && path === "/api/admin/summary") {
+    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
+      description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','approved','rejected')),
+      admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
+      reviewed_by TEXT REFERENCES users(id), review_token TEXT
+    )`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
+      id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+      user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL,
+      tenure_months INTEGER NOT NULL, remaining_months INTEGER NOT NULL,
+      monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const [users,accounts,balances,loanStats,cardStats,requestStats,loanApps,cardApps] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) AS n FROM users WHERE role='customer'").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM accounts").first(),
+      env.DB.prepare("SELECT COALESCE(SUM(balance),0) AS n FROM accounts WHERE status='active'").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(principal_amount),0) AS principal,COALESCE(SUM(outstanding_amount),0) AS outstanding FROM demo_loans").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(credit_limit),0) AS limits,COALESCE(SUM(outstanding),0) AS outstanding FROM virtual_cards").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n,COALESCE(SUM(CASE WHEN type='deposit' THEN amount ELSE 0 END),0) AS deposits,COALESCE(SUM(CASE WHEN type='withdrawal' THEN amount ELSE 0 END),0) AS withdrawals FROM money_requests WHERE status='approved'").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM loan_applications WHERE status IN ('pending','need_documents','verified')").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM card_applications WHERE status IN ('pending','need_documents','verified')").first()
+    ]);
+    const repayments = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM ledger WHERE type IN ('loan_repayment','loan_foreclosure')").first();
+    const disbursed = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM ledger WHERE type='loan_disbursement'").first();
+    return response({customers:Number(users?.n||0),accounts:Number(accounts?.n||0),customerBalances:Number(balances?.n||0),loanCount:Number(loanStats?.n||0),loanPrincipal:Number(loanStats?.principal||0),loanOutstanding:Number(loanStats?.outstanding||0),cardCount:Number(cardStats?.n||0),cardLimits:Number(cardStats?.limits||0),cardOutstanding:Number(cardStats?.outstanding||0),approvedDeposits:Number(requestStats?.deposits||0),approvedWithdrawals:Number(requestStats?.withdrawals||0),loanDisbursed:Number(disbursed?.n||0),loanRepaid:Number(repayments?.n||0),pendingLoanApplications:Number(loanApps?.n||0),pendingCardApplications:Number(cardApps?.n||0)},200,request);
+  }
+
   if (method === "GET" && path === "/api/admin/customers") {
     if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
     const q = String(url.searchParams.get("q") || "").trim().slice(0,100);
@@ -147,6 +179,13 @@ async function route(request, env) {
   }
 
   // Offers are fictional simulator content, managed by admins in the dashboard.
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS offer_assignments (
+    offer_id TEXT NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    assigned_by TEXT REFERENCES users(id), assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(offer_id,user_id)
+  )`).run().catch(()=>{});
+
   if (path === "/api/offers" && method === "GET") {
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS offers (
       id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
@@ -166,8 +205,15 @@ async function route(request, env) {
     }
     const rows = user.role === "admin"
       ? await env.DB.prepare("SELECT * FROM offers ORDER BY created_at DESC").all()
-      : await env.DB.prepare("SELECT * FROM offers WHERE active=1 AND (valid_until='' OR valid_until>=date('now')) ORDER BY created_at DESC").all();
+      : await env.DB.prepare("SELECT o.* FROM offers o WHERE o.active=1 AND (o.valid_until='' OR o.valid_until>=date('now')) AND (NOT EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id) OR EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id AND oa.user_id=?)) ORDER BY o.created_at DESC").bind(user.id).all();
     return response({ offers: rows.results || [] }, 200, request);
+  }
+
+  const offerAssignmentsMatch = path.match(/^\/api\/admin\/offers\/([^/]+)\/assignments$/);
+  if (offerAssignmentsMatch && method === "GET") {
+    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    const rows = await env.DB.prepare("SELECT oa.user_id,u.display_name,u.username FROM offer_assignments oa JOIN users u ON u.id=oa.user_id WHERE oa.offer_id=? ORDER BY u.display_name").bind(offerAssignmentsMatch[1]).all();
+    return response({users:rows.results||[]},200,request);
   }
 
   if (path === "/api/admin/offers" && method === "POST") {
@@ -463,6 +509,21 @@ async function route(request, env) {
   if (method === "POST" && path.startsWith("/api/admin/")) {
     if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
     const d = await body(request);
+
+    const assignOfferMatch = path.match(/^\/api\/admin\/offers\/([^/]+)\/assign$/);
+    if (assignOfferMatch) {
+      const targetUser = String(d.userId || "").trim();
+      const offer = await env.DB.prepare("SELECT id,title FROM offers WHERE id=?").bind(assignOfferMatch[1]).first();
+      const customer = await env.DB.prepare("SELECT id FROM users WHERE id=? AND role='customer'").bind(targetUser).first();
+      if (!offer || !customer) return response({error:"Offer or customer not found."},404,request);
+      if (d.assigned === false) {
+        await env.DB.prepare("DELETE FROM offer_assignments WHERE offer_id=? AND user_id=?").bind(offer.id,customer.id).run();
+      } else {
+        await env.DB.prepare("INSERT OR IGNORE INTO offer_assignments(offer_id,user_id,assigned_by) VALUES(?,?,?)").bind(offer.id,customer.id,user.id).run();
+      }
+      await audit(env,user,d.assigned===false?"offer_unassigned":"offer_assigned","offer",offer.id,{userId:customer.id,title:offer.title});
+      return response({ok:true},200,request);
+    }
 
     const foreclosureMatch = path.match(/^\/api\/admin\/loans\/([^/]+)\/foreclose$/);
     if (foreclosureMatch) {
