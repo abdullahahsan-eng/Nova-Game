@@ -9,14 +9,40 @@ $("#loginForm").addEventListener("submit",async e=>{e.preventDefault();try{const
 $("#registerForm").addEventListener("submit",async e=>{e.preventDefault();try{await api("/register",{method:"POST",body:JSON.stringify(formData(e.target))});e.target.reset();notice("Demo account created. Ab sign in karein.");}catch(err){notice(err.message,true)}});
 $("#logoutBtn").addEventListener("click",async()=>{try{await api("/logout",{method:"POST",body:"{}"})}catch{}token="";me=null;localStorage.removeItem("novabank_token");setAuth(true);notice("You have been logged out.");});
 $("#transferForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);d.amount=Number(d.amount);const r=await api("/transfer",{method:"POST",body:JSON.stringify(d)});e.target.reset();await loadDashboard();notice(r.message)}catch(err){notice(err.message,true)}});
-$("#loanForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);["requestedAmount","monthlyIncome","monthlyExpenses","existingEmi","tenureMonths"].forEach(k=>d[k]=Number(d[k]||0));const r=await api("/loans",{method:"POST",body:JSON.stringify(d)});e.target.reset();await loadDashboard();notice(`${r.message} Suggested eligibility: N₹${money(r.suggestedEligibility*100)}. This is only a demo estimate.`)}catch(err){notice(err.message,true)}});
-$("#cardForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);["requestedLimit","monthlyIncome","monthlyExpenses","existingDebt"].forEach(k=>d[k]=Number(d[k]||0));const r=await api("/cards",{method:"POST",body:JSON.stringify(d)});e.target.reset();await loadDashboard();notice(`${r.message} Suggested limit: N₹${money(r.suggestedLimit*100)}.`)}catch(err){notice(err.message,true)}});
+$("#loanForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);["requestedAmount","monthlyIncome","monthlyExpenses","existingEmi","tenureMonths"].forEach(k=>d[k]=Number(d[k]||0));const r=await api("/loans",{method:"POST",body:JSON.stringify(d)});e.target.reset();closeApplicationModal();await loadDashboard();notice(`${r.message} Suggested eligibility: N₹${money(r.suggestedEligibility*100)}. This is only a demo estimate.`)}catch(err){notice(err.message,true)}});
+$("#cardForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);["requestedLimit","monthlyIncome","monthlyExpenses","existingDebt"].forEach(k=>d[k]=Number(d[k]||0));const r=await api("/cards",{method:"POST",body:JSON.stringify(d)});e.target.reset();closeApplicationModal();await loadDashboard();notice(`${r.message} Suggested limit: N₹${money(r.suggestedLimit*100)}.`)}catch(err){notice(err.message,true)}});
 $("#refreshAdmin").addEventListener("click",()=>loadAdmin().catch(e=>notice(e.message,true)));
 $("#offerForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);await api("/admin/offers",{method:"POST",body:JSON.stringify(d)});e.target.reset();await loadOffers();notice("Demo offer published.");}catch(err){notice(err.message,true)}});
 async function loadOffers(){const d=await api("/offers");const offers=d.offers||[];const grid=$("#offersGrid");grid.innerHTML=offers.filter(x=>me?.role==="admin"||Number(x.active)===1).map(x=>`<article class="offer-card"><div class="offer-top"><span class="offer-category">${esc(x.category)}</span><span class="offer-star">✦</span></div><h3>${esc(x.title)}</h3><p>${esc(x.description)}</p>${x.benefit?`<div class="offer-benefit">${esc(x.benefit)}</div>`:""}<button class="btn ${x.category==="Personal Loan"?"primary":"secondary"}" type="button" onclick="offerAction('${esc(x.category)}')">${esc(x.cta_label||"Explore offer")} →</button></article>`).join("")||'<p class="empty">No active offers right now.</p>';
 const admin=$("#adminOffers");if(admin)admin.innerHTML=me?.role==="admin"?offers.map(x=>`<div class="activity-item"><div><strong>${esc(x.title)}</strong><small>${esc(x.category)} · ${Number(x.active)===1?"Active":"Inactive"}</small></div><button class="btn ghost" type="button" onclick="toggleOffer('${esc(x.id)}',${Number(x.active)===1?"false":"true"})">${Number(x.active)===1?"Deactivate":"Activate"}</button></div>`).join(""):'<p class="empty">Admin access required.</p>';
 }
-window.offerAction=(category)=>{if(category==="Personal Loan"){$("#loanForm").scrollIntoView({behavior:"smooth",block:"center"});notice("Fill out the demo loan form to continue.");}else if(category==="Credit Card"){$("#cardForm").scrollIntoView({behavior:"smooth",block:"center"});notice("Fill out the demo virtual card form to continue.");}else{notice("This is a fictional simulator offer. Rewards are not real money.");}};
+function openApplicationModal(type){
+  const modal=$("#applicationModal");
+  $("#loanApplicationContent").classList.toggle("hidden",type!=="loan");
+  $("#cardOfferDetails").classList.toggle("hidden",type!=="card-details");
+  $("#cardApplicationContent").classList.toggle("hidden",type!=="card-form");
+  $("#modalTitle").textContent=type==="loan"?"Nova Flexi Loan": "Nova Rewards Card";
+  $("#modalSubtitle").textContent=type==="loan"?"Apply for a fictional demo loan. Approval is not guaranteed.":"Fictional card application for learning and play only.";
+  modal.classList.remove("hidden");
+  document.body.classList.add("modal-open");
+  const focusTarget=type==="loan"?$("#loanForm input"):type==="card-form"?$("#cardForm input"):$("#continueCardApplication");
+  setTimeout(()=>focusTarget?.focus(),50);
+}
+function closeApplicationModal(){
+  $("#applicationModal").classList.add("hidden");
+  document.body.classList.remove("modal-open");
+}
+window.offerAction=(category)=>{
+  if(category==="Personal Loan") openApplicationModal("loan");
+  else if(category==="Credit Card") openApplicationModal("card-details");
+  else if(category==="Shopping"||category==="Rewards") notice("This is a fictional simulator offer. Rewards are not real money.");
+  else notice("This is a fictional simulator offer for learning and play.");
+};
+$("#closeApplicationModal").addEventListener("click",closeApplicationModal);
+$("#backToDashboard").addEventListener("click",closeApplicationModal);
+$("#continueCardApplication").addEventListener("click",()=>openApplicationModal("card-form"));
+$("#applicationModal").addEventListener("click",e=>{if(e.target.id==="applicationModal")closeApplicationModal();});
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#applicationModal").classList.contains("hidden"))closeApplicationModal();});
 window.toggleOffer=async(id,active)=>{try{await api(`/admin/offers/${id}`,{method:"PATCH",body:JSON.stringify({active})});await loadOffers();notice(active?"Offer activated.":"Offer deactivated.");}catch(e){notice(e.message,true)}};
 async function loadDashboard(){const d=await api("/me");me=d.user;setAuth(false);$("#userName").textContent=me.display_name||me.displayName||me.username;$("#roleBadge").textContent=me.role.toUpperCase();$("#adminPanel").classList.toggle("hidden",me.role!=="admin");
 const [a,t,l,c]=await Promise.all([api("/accounts"),api("/transactions"),api("/loans"),api("/cards")]);accounts=a.accounts||[];const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);$("#balance").textContent=money(total);$("#heroBalance").textContent=money(total);$("#txCount").textContent=(t.transactions||[]).length;$("#loanCount").textContent=(l.applications||[]).length;$("#cardCount").textContent=(c.applications||[]).length;
