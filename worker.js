@@ -196,33 +196,102 @@ async function route(request, env) {
     const rows = await q.all();
     return response({ transactions: rows.results || [] }, 200, request);
   }
-  // Demo deposits and withdrawals only. Amounts are stored as integer cents.
+  // Legacy direct balance-changing endpoints are intentionally disabled. Customers must request admin review.
   if (method === "POST" && (path === "/api/deposit" || path === "/api/withdraw")) {
-    const d = await body(request);
-    const amount = Math.round(Number(d.amount) * 100);
-    const isDeposit = path === "/api/deposit";
-    if (!Number.isSafeInteger(amount) || amount < 100 || amount > 100000000) {
-      return response({ error: "Amount must be between N₹1 and N₹1,000,000." }, 400, request);
-    }
-    const account = await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(String(d.accountId||""), user.id).first();
+    return response({ error: "Direct balance changes are disabled. Submit a deposit or withdrawal request for admin approval." }, 403, request);
+  }
+
+  if (path === "/api/money-requests" && method === "GET") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
+      description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','approved','rejected')),
+      admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
+      reviewed_by TEXT REFERENCES users(id), review_token TEXT
+    )`).run();
+    const rows = user.role === "admin"
+      ? await env.DB.prepare("SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300").all()
+      : await env.DB.prepare("SELECT r.*,a.account_number FROM money_requests r JOIN accounts a ON a.id=r.account_id WHERE r.user_id=? ORDER BY r.created_at DESC LIMIT 100").bind(user.id).all();
+    return response({ requests: rows.results || [] }, 200, request);
+  }
+  if (path === "/api/money-requests" && method === "POST") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
+      description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','approved','rejected')),
+      admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
+      reviewed_by TEXT REFERENCES users(id), review_token TEXT
+    )`).run();
+    const d = await body(request), amount = Math.round(Number(d.amount) * 100), type = String(d.type || '');
+    if (!['deposit','withdrawal'].includes(type) || !Number.isSafeInteger(amount) || amount < 100 || amount > 100000000)
+      return response({ error: "Choose deposit or withdrawal and enter an amount from N₹1 to N₹1,000,000." }, 400, request);
+    const account = await env.DB.prepare("SELECT id,balance,account_number FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(String(d.accountId||''),user.id).first();
     if (!account) return response({ error: "Active demo account not found." }, 404, request);
-    if (!isDeposit && Number(account.balance) < amount) return response({ error: "Insufficient demo balance for this withdrawal." }, 400, request);
-    const group = uid(), ledgerId = uid();
-    const nextBalance = isDeposit ? Number(account.balance) + amount : Number(account.balance) - amount;
-    const description = String(d.description || (isDeposit ? "Demo deposit" : "Demo withdrawal")).trim().slice(0,100) || (isDeposit ? "Demo deposit" : "Demo withdrawal");
-    const updateSql = isDeposit
-      ? "UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=? AND status='active'"
-      : "UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND status='active' AND balance>=?";
-    const update = isDeposit
-      ? env.DB.prepare(updateSql).bind(amount, account.id, user.id)
-      : env.DB.prepare(updateSql).bind(amount, account.id, user.id, amount);
-    const insert = env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) SELECT ?,id,?,?,?,?,? FROM accounts WHERE id=? AND user_id=? AND balance=? AND changes()>0")
-      .bind(ledgerId, group, isDeposit ? "deposit" : "withdrawal", amount, nextBalance, description, account.id, user.id, nextBalance);
-    const results = await env.DB.batch([update, insert]);
-    if (!results?.[0]?.meta?.changes) return response({ error: isDeposit ? "Deposit could not be recorded. Refresh and try again." : "Insufficient demo balance or withdrawal could not be recorded." }, 400, request);
-    await audit(env, user, isDeposit ? "demo_deposit" : "demo_withdrawal", "transaction", group, { accountId: account.id, amount, description });
-    await notify(env, user.id, isDeposit ? "Demo deposit recorded" : "Demo withdrawal recorded", `N₹${(amount/100).toFixed(2)} demo ${isDeposit?"deposit":"withdrawal"} recorded. New demo balance: N₹${(nextBalance/100).toFixed(2)}.`);
-    return response({ ok: true, transactionId: group, message: `${isDeposit ? "Demo deposit" : "Demo withdrawal"} recorded. New balance: N₹${(nextBalance/100).toFixed(2)}.` }, 200, request);
+    if (type === 'withdrawal' && Number(account.balance) < amount) return response({ error: "Requested withdrawal exceeds your current demo balance." }, 400, request);
+    const id = "MR-" + uid().replace(/-/g,'').slice(0,12).toUpperCase();
+    const description = String(d.description || (type==='deposit'?'Demo deposit request':'Demo withdrawal request')).trim().slice(0,100);
+    await env.DB.prepare("INSERT INTO money_requests(id,user_id,account_id,type,amount,description) VALUES(?,?,?,?,?,?)").bind(id,user.id,account.id,type,amount,description).run();
+    await notify(env,user.id,"Money request submitted",`${type==='deposit'?'Deposit':'Withdrawal'} request ${id} for N₹${(amount/100).toFixed(2)} is awaiting admin review. Your balance has not changed.`);
+    await audit(env,user,"money_request_submitted","money_request",id,{type,amount,accountId:account.id});
+    return response({ok:true,requestId:id,message:"Request submitted for admin approval. Your balance has not changed."},201,request);
+  }
+  if (method === "GET" && path === "/api/admin/money-requests") {
+    if (user.role !== 'admin') return response({error:"Admin permission required."},403,request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
+      description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','approved','rejected')),
+      admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
+      reviewed_by TEXT REFERENCES users(id), review_token TEXT
+    )`).run();
+    const rows=await env.DB.prepare("SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 300").all();
+    return response({requests:rows.results||[]},200,request);
+  }
+  const moneyReview = path.match(/^\/api\/admin\/money-requests\/([^/]+)\/review$/);
+  if (moneyReview && method === "POST") {
+    if (user.role !== 'admin') return response({error:"Admin permission required."},403,request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
+      description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','approved','rejected')),
+      admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
+      reviewed_by TEXT REFERENCES users(id), review_token TEXT
+    )`).run();
+    const d=await body(request), status=String(d.status||''), note=String(d.note||'').trim().slice(0,250);
+    if(!['approved','rejected'].includes(status)) return response({error:'Choose approve or reject.'},400,request);
+    const r=await env.DB.prepare("SELECT * FROM money_requests WHERE id=?").bind(moneyReview[1]).first();
+    if(!r) return response({error:'Money request not found.'},404,request);
+    if(r.status!=='pending') return response({error:`This request has already been ${r.status}.`},409,request);
+    if(status==='rejected') {
+      const result=await env.DB.prepare("UPDATE money_requests SET status='rejected',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(note,user.id,r.id).run();
+      if(!result.meta?.changes) return response({error:'Request was already processed. Refresh the queue.'},409,request);
+      await notify(env,r.user_id,'Money request rejected',`Request ${r.id} was rejected. ${note}`);
+      await audit(env,user,'money_request_rejected','money_request',r.id,{type:r.type,amount:r.amount,note});
+      return response({ok:true,message:`Request ${r.id} rejected. Balance unchanged.`},200,request);
+    }
+    const account=await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND status='active'").bind(r.account_id).first();
+    if(!account) return response({error:'Linked account is not active; request cannot be approved.'},400,request);
+    if(r.type==='withdrawal' && Number(account.balance)<Number(r.amount)) return response({error:'Insufficient current balance. Reject this request or ask customer to submit a new amount.'},400,request);
+    const token=uid(), group=uid(), ledgerId=uid(), amount=Number(r.amount);
+    const nextBalance=r.type==='deposit'?Number(account.balance)+amount:Number(account.balance)-amount;
+    const updateBalance=r.type==='deposit'
+      ? env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND status='active' AND EXISTS(SELECT 1 FROM money_requests WHERE id=? AND status='processing' AND review_token=?)").bind(amount,account.id,r.id,token)
+      : env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND status='active' AND balance>=? AND EXISTS(SELECT 1 FROM money_requests WHERE id=? AND status='processing' AND review_token=?)").bind(amount,account.id,amount,r.id,token);
+    // D1 batch makes the balance, ledger, and request status changes atomic.
+    const results=await env.DB.batch([
+      env.DB.prepare("UPDATE money_requests SET status='processing',review_token=?,admin_note=?,reviewed_by=? WHERE id=? AND status='pending'").bind(token,note,user.id,r.id),
+      updateBalance,
+      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) SELECT ?,?,?,?, ?,?,? WHERE EXISTS(SELECT 1 FROM money_requests WHERE id=? AND status='processing' AND review_token=?) AND EXISTS(SELECT 1 FROM accounts WHERE id=? AND balance=?)").bind(ledgerId,account.id,group,r.type==='deposit'?'deposit':'withdrawal',amount,nextBalance,`${r.type==='deposit'?'Admin-approved demo deposit':'Admin-approved demo withdrawal'} · ${r.id}`,r.id,token,account.id,nextBalance),
+      env.DB.prepare("UPDATE money_requests SET status='approved',reviewed_at=datetime('now'),review_token=NULL WHERE id=? AND status='processing' AND review_token=? AND EXISTS(SELECT 1 FROM ledger WHERE id=? AND transaction_group=?)").bind(r.id,token,ledgerId,group)
+    ]);
+    const changed=Number(results?.[1]?.meta?.changes||0), ledgerChanged=Number(results?.[2]?.meta?.changes||0), approvedChanged=Number(results?.[3]?.meta?.changes||0);
+    if(!changed || !ledgerChanged || !approvedChanged) {
+      await env.DB.prepare("UPDATE money_requests SET status='pending',review_token=NULL,admin_note='Approval could not be completed; please review again.' WHERE id=? AND status='processing' AND review_token=?").bind(r.id,token).run();
+      return response({error:'Approval could not be completed safely. Refresh and retry; no completed approval was recorded.'},409,request);
+    }
+    await notify(env,r.user_id,'Money request approved',`${r.type==='deposit'?'Deposit':'Withdrawal'} request ${r.id} approved. N₹${(amount/100).toFixed(2)} demo balance ${r.type==='deposit'?'credited':'debited'}.`);
+    await audit(env,user,'money_request_approved','money_request',r.id,{type:r.type,amount,accountId:r.account_id,transactionGroup:group,note});
+    return response({ok:true,message:`Request ${r.id} approved. Demo balance updated to N₹${(nextBalance/100).toFixed(2)}.`},200,request);
   }
 
   if (method === "POST" && path === "/api/transfer") {
