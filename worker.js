@@ -112,12 +112,34 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/transactions") {
     const accountId = url.searchParams.get("accountId");
-    const owner = await env.DB.prepare("SELECT id FROM accounts WHERE id=? AND user_id=?").bind(accountId, user.id).first();
-    if (user.role !== "admin" && !owner) return response({ error: "Account not found." }, 404, request);
-    const q = user.role === "admin" && !accountId
-      ? env.DB.prepare("SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id ORDER BY l.created_at DESC LIMIT 500")
-      : env.DB.prepare("SELECT l.* FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.id=? ORDER BY l.created_at DESC LIMIT 200").bind(accountId);
-    const rows = await q.all(); return response({ transactions: rows.results || [] }, 200, request);
+    let q;
+
+    // Customers may load recent activity before selecting an account.
+    // In that case, return transactions for all accounts they own.
+    if (user.role === "admin" && !accountId) {
+      q = env.DB.prepare(
+        "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id ORDER BY l.created_at DESC LIMIT 500"
+      );
+    } else if (!accountId && user.role !== "admin") {
+      q = env.DB.prepare(
+        "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.user_id=? ORDER BY l.created_at DESC LIMIT 200"
+      ).bind(user.id);
+    } else if (user.role === "admin") {
+      q = env.DB.prepare(
+        "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.id=? ORDER BY l.created_at DESC LIMIT 200"
+      ).bind(accountId);
+    } else {
+      const owner = await env.DB.prepare(
+        "SELECT id FROM accounts WHERE id=? AND user_id=?"
+      ).bind(accountId, user.id).first();
+      if (!owner) return response({ error: "Account not found." }, 404, request);
+      q = env.DB.prepare(
+        "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.id=? AND a.user_id=? ORDER BY l.created_at DESC LIMIT 200"
+      ).bind(accountId, user.id);
+    }
+
+    const rows = await q.all();
+    return response({ transactions: rows.results || [] }, 200, request);
   }
   if (method === "POST" && path === "/api/transfer") {
     const d = await body(request), amount = Math.round(Number(d.amount) * 100);
