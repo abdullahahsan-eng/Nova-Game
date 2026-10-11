@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#081421">
+<title>NovaBank | Super Admin</title>
+<link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+<header class="top"><a class="brand" href="/">Nova<span>Bank</span><small>SUPER ADMIN CONSOLE</small></a><div class="top-actions"><span class="demo">FICTIONAL SIMULATOR</span><button id="logout" class="btn ghost hidden">Log out</button><a class="btn ghost" href="/">Customer portal ↗</a></div></header>
+<main>
+<section id="loginPanel" class="login-grid">
+  <div class="intro"><p class="eyebrow">RESTRICTED ACCESS</p><h1>Super Admin<br><span>Control Centre</span></h1><p>Manage customers, accounts, demo loans, virtual cards and recorded activity from one dedicated portal.</p><p class="warning">Demo simulator only · No real money or real banking services.</p></div>
+  <form id="loginForm" class="panel"><p class="eyebrow">ADMIN SIGN IN</p><h2>Welcome back</h2><label>Username or email<input name="login" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button class="btn primary" type="submit">Sign in securely →</button><p id="loginError" class="error"></p></form>
+</section>
+<section id="app" class="hidden">
+  <div class="heading"><div><p class="eyebrow">OPERATIONS OVERVIEW</p><h1>Super Admin <span>Control Centre</span></h1><p id="welcome" class="muted"></p></div><span class="role">SUPER ADMIN</span></div>
+  <div id="notice" class="notice hidden"></div>
+  <div class="stats">
+    <article><small>Customers found</small><strong id="statCustomers">0</strong></article>
+    <article><small>Accounts</small><strong id="statAccounts">0</strong></article>
+    <article><small>Active demo loans</small><strong id="statLoans">0</strong></article>
+    <article><small>Pending applications</small><strong id="statPending">0</strong></article>
+  </div>
+  <section class="panel search-panel">
+    <div><p class="eyebrow">CUSTOMER LOOKUP</p><h2>Find a customer</h2><p class="muted">Search by customer name, username, email or account number.</p></div>
+    <form id="searchForm" class="search-form"><input id="query" name="q" placeholder="e.g. Faisal Mansoor or NB3649658683" autocomplete="off"><button class="btn primary" type="submit">Search</button><button id="clearSearch" class="btn ghost" type="button">Clear</button></form>
+    <div id="customerResults" class="results"><p class="muted">Enter a name or account number to search customers.</p></div>
+  </section>
+  <section id="detailPanel" class="panel hidden">
+    <div class="section-head"><div><p class="eyebrow">CUSTOMER PROFILE</p><h2 id="customerTitle">Customer details</h2><p id="customerMeta" class="muted"></p></div><button id="closeDetails" class="btn ghost" type="button">Close details</button></div>
+    <div id="profileGrid" class="profile-grid"></div>
+    <div class="section-head sub"><div><p class="eyebrow">ACCOUNT CONTROLS</p><h3>Accounts</h3></div></div><div id="accounts" class="cards-grid"></div>
+    <div class="section-head sub"><div><p class="eyebrow">LOAN MANAGEMENT</p><h3>Loans & foreclosure</h3><p class="muted">Full one-time foreclosure deducts the complete outstanding amount from the customer's active fictional account.</p></div></div><div id="loans" class="cards-grid"></div>
+    <div class="section-head sub"><div><p class="eyebrow">VIRTUAL CREDIT</p><h3>Credit cards</h3></div></div><div id="cards" class="cards-grid"></div>
+    <div class="section-head sub"><div><p class="eyebrow">APPLICATIONS</p><h3>Loan & card applications</h3></div></div><div id="applications" class="cards-grid"></div>
+    <div class="section-head sub"><div><p class="eyebrow">RECENT ACTIVITY</p><h3>Transactions</h3></div></div><div id="transactions" class="table-wrap"></div>
+  </section>
+  <footer>NovaBank is a fictional simulator. All balances, loans and payments are demo-only.</footer>
+</section>
+</main>
+<script src="/admin.js" defer></script>
+</body></html>
