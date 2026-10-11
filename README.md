@@ -34,3 +34,10 @@ Open `public/index.html` directly for the UI preview. API actions require deploy
 ## Currency and roles
 - Currency: N₹ (fictional only)
 - Roles: customer and admin in this phase. The schema is ready for expansion to branch manager, loan officer, credit officer, cashier, and auditor.
+
+
+## Offers for You feature
+- The Worker creates the `offers` table if it is missing and seeds three fictional offers on first read.
+- Signed-in customers see active offers. Admin users can create offers and activate/deactivate them.
+- Run `schema.sql` only if you are initializing a fresh D1 database; the Worker can create the offers table itself.
+- Offers are fictional simulator content, not real financial products.

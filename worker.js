@@ -104,6 +104,61 @@ async function route(request, env) {
   if (!user) return response({ error: "Please log in." }, 401, request);
   if (method === "GET" && path === "/api/me") return response({ user }, 200, request);
 
+  // Offers are fictional simulator content, managed by admins in the dashboard.
+  if (path === "/api/offers" && method === "GET") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS offers (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
+      description TEXT NOT NULL, benefit TEXT NOT NULL DEFAULT '', cta_label TEXT NOT NULL DEFAULT 'Explore offer',
+      active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), valid_until TEXT NOT NULL DEFAULT '',
+      created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM offers").first();
+    if (!count || Number(count.n) === 0) {
+      const seeds = [
+        [uid(), "Nova Rewards Card", "Credit Card", "Explore a fictional virtual card with reward points for simulated purchases.", "Up to 5% demo rewards", "View card options", 1, ""],
+        [uid(), "Nova Flexi Loan", "Personal Loan", "Try a sample loan application and see a simulated eligibility estimate. Approval is not guaranteed.", "0% demo interest", "Apply for demo loan", 1, ""],
+        [uid(), "Smart Shopper Bonus", "Shopping", "Earn fictional reward points by completing learning challenges in the simulator.", "500 demo points", "Explore rewards", 1, ""]
+      ];
+      await env.DB.batch(seeds.map(x => env.DB.prepare("INSERT INTO offers(id,title,category,description,benefit,cta_label,active,valid_until) VALUES(?,?,?,?,?,?,?,?)").bind(...x)));
+    }
+    const rows = user.role === "admin"
+      ? await env.DB.prepare("SELECT * FROM offers ORDER BY created_at DESC").all()
+      : await env.DB.prepare("SELECT * FROM offers WHERE active=1 AND (valid_until='' OR valid_until>=date('now')) ORDER BY created_at DESC").all();
+    return response({ offers: rows.results || [] }, 200, request);
+  }
+
+  if (path === "/api/admin/offers" && method === "POST") {
+    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS offers (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
+      description TEXT NOT NULL, benefit TEXT NOT NULL DEFAULT '', cta_label TEXT NOT NULL DEFAULT 'Explore offer',
+      active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), valid_until TEXT NOT NULL DEFAULT '',
+      created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run();
+    const d = await body(request);
+    const title = String(d.title || '').trim(), category = String(d.category || '').trim(), description = String(d.description || '').trim();
+    if (title.length < 3 || title.length > 90 || !["Credit Card","Personal Loan","Shopping","Rewards","Other"].includes(category) || description.length < 8 || description.length > 500)
+      return response({ error: "Enter a title, valid category, and description (8–500 characters)." }, 400, request);
+    const id = uid();
+    await env.DB.prepare("INSERT INTO offers(id,title,category,description,benefit,cta_label,active,valid_until,created_by) VALUES(?,?,?,?,?,?,?,?,?)")
+      .bind(id, title, category, description, String(d.benefit || '').trim().slice(0,120), String(d.ctaLabel || 'Explore offer').trim().slice(0,40), d.active === false ? 0 : 1, String(d.validUntil || '').trim(), user.id).run();
+    await audit(env, user, "offer_created", "offer", id, { title, category });
+    return response({ ok: true, id }, 201, request);
+  }
+
+  const offerMatch = path.match(/^\/api\/admin\/offers\/([^/]+)$/);
+  if (offerMatch && method === "PATCH") {
+    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    const d = await body(request), current = await env.DB.prepare("SELECT * FROM offers WHERE id=?").bind(offerMatch[1]).first();
+    if (!current) return response({ error: "Offer not found." }, 404, request);
+    const active = d.active === undefined ? current.active : (d.active ? 1 : 0);
+    await env.DB.prepare("UPDATE offers SET active=?, updated_at=datetime('now') WHERE id=?").bind(active, current.id).run();
+    await audit(env, user, active ? "offer_activated" : "offer_deactivated", "offer", current.id, { title: current.title });
+    return response({ ok: true, active }, 200, request);
+  }
+
   if (method === "GET" && path === "/api/accounts") {
     const rows = user.role === "admin"
       ? await env.DB.prepare("SELECT a.*,u.display_name,u.username FROM accounts a JOIN users u ON u.id=a.user_id ORDER BY a.opened_at DESC LIMIT 500").all()
