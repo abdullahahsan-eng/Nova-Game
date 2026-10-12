@@ -2,56 +2,9 @@
 
 .offers-section{margin:10px auto 20px;max-width:1152px}.offers-section .panel-heading{align-items:flex-start}.offers-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.offer-card{display:flex;flex-direction:column;gap:10px;padding:18px;border-radius:14px;border:1px solid #25485a;background:linear-gradient(145deg,#112b3a,#0b1b29);min-width:0}.offer-top{display:flex;justify-content:space-between;align-items:center}.offer-category{font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:var(--green);font-weight:800;border:1px solid #28675e;background:#10332f;border-radius:20px;padding:5px 8px}.offer-star{color:var(--green);font-size:20px}.offer-card h3{font-size:17px;margin:0}.offer-card p{font-size:12px;color:var(--muted);margin:0;flex:1}.offer-benefit{font-size:12px;font-weight:800;color:#d8fff1}.offer-card .btn{width:100%;margin-top:3px}.admin-offer-manager{margin-top:25px;padding-top:22px;border-top:1px solid #ffffff18}.admin-offer-manager h3{margin:6px 0 12px}.offer-list-title{margin-top:24px!important}@media(max-width:760px){.offers-section{margin-left:16px;margin-right:16px}.offers-grid{grid-template-columns:1fr}.offer-card{padding:16px}}
 
-/* Focused loan/card application flow */
-.modal-backdrop{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(2,8,14,.78);backdrop-filter:blur(10px);overflow-y:auto}
-.application-modal{width:min(650px,100%);max-height:min(88vh,900px);overflow-y:auto;box-shadow:0 30px 100px #0009;border-color:#2c5265;padding:clamp(20px,4vw,32px)}
-.modal-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;border-bottom:1px solid #ffffff14;padding-bottom:16px;margin-bottom:18px}
-.modal-heading h2{margin:7px 0 2px;font-size:25px}
-.modal-heading p{margin:5px 0 0}
-.modal-close{flex:0 0 auto;padding:8px 12px}
-.modal-back{width:100%;margin-top:18px}
-.card-offer-details{padding:4px 0 0}
-.demo-card-preview{min-height:165px;border:1px solid #ffffff25;border-radius:16px;padding:20px;background:radial-gradient(circle at 85% 20%,#2e8d7b66,transparent 35%),linear-gradient(130deg,#164e4d,#102d43 60%,#173449);display:flex;flex-direction:column;align-items:flex-start;gap:8px;margin-bottom:22px}
-.demo-card-preview span{font-size:10px;letter-spacing:1.5px;font-weight:800}
-.demo-card-preview strong{font-size:24px;margin-top:auto}
-.demo-card-preview small{font-size:9px;letter-spacing:1px;color:#c8e0e1}
-.modal-benefits{color:#c9d9e3;font-size:13px;padding-left:20px;line-height:2}
-#loanApplicationContent form,#cardApplicationContent form{margin-top:8px}
-body.modal-open{overflow:hidden}
-@media(max-width:600px){.modal-backdrop{padding:12px;align-items:flex-start}.application-modal{max-height:calc(100vh - 24px);padding:18px;border-radius:15px}.modal-heading h2{font-size:21px}.demo-card-preview{min-height:145px}.modal-heading .muted{font-size:12px}}
-
-/* Account Information */
-.account-info-section{max-width:1152px;margin:0 auto 20px}
-.account-info-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
-.account-info-item{min-width:0;padding:13px 14px;border:1px solid #203b4f;border-radius:11px;background:linear-gradient(145deg,#0b1b29,#0d2030)}
-.account-info-item>span{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}
-.account-info-item strong{display:block;overflow-wrap:anywhere;font-size:13px;font-weight:750;color:var(--text)}
-.account-info-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;flex-wrap:wrap}
-.status-active{background:#103a30;color:#7cf0c0;border:1px solid #28675e}
-@media(max-width:760px){.account-info-section{margin-left:16px;margin-right:16px}.account-info-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:420px){.account-info-grid{grid-template-columns:1fr}.account-info-actions{align-items:flex-start;flex-direction:column}}
-
-/* Cards & Loans and application journey */
-.cards-loans-panel{grid-column:auto}
-.products-grid{display:grid;grid-template-columns:1fr;gap:12px;align-items:stretch}
-.product-card,.product-summary,.product-empty{min-width:0;border:1px solid #25485a;border-radius:14px;padding:17px;background:linear-gradient(145deg,#112b3a,#0b1b29)}
-.debit-product{background:linear-gradient(130deg,#164e4d,#102d43 60%,#173449);border-color:#33796e}
-.product-card-top,.product-summary-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.product-chip,.product-type{font-size:9px;letter-spacing:1px;font-weight:900;color:var(--green);border:1px solid #347d6e;border-radius:30px;padding:5px 8px}
-.product-status{font-size:10px;text-transform:uppercase;color:#a9ffe0;font-weight:800}
-.demo-card-brand{font-size:22px;font-weight:900;margin-top:25px}.demo-card-brand span{color:var(--green)}
-.masked-card-number{font-size:17px;letter-spacing:2px;font-weight:800;margin:18px 0 20px;overflow-wrap:anywhere}.small-mask{font-size:14px;margin:12px 0}
-.product-card-bottom{display:grid;grid-template-columns:1fr 1fr;gap:8px}.product-card-bottom small,.product-metrics small{display:block;color:#a4bac9;font-size:9px;letter-spacing:.5px;margin-bottom:4px}.product-card-bottom b{display:block;font-size:11px;overflow-wrap:anywhere}
-.product-summary h4,.product-empty h4{margin:12px 0 8px;font-size:16px}.product-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:15px 0}.product-metrics b{font-size:13px;overflow-wrap:anywhere}.product-empty{display:flex;flex-direction:column;align-items:flex-start;justify-content:center}.product-empty p{color:var(--muted);font-size:12px}.full-btn{width:100%;margin-top:8px}
-.field-help{display:block;font-size:10px;color:var(--muted);line-height:1.5;margin-top:6px}.estimate-box{border:1px solid #28675e;background:#0b2a29;color:#bfffe8;border-radius:10px;padding:12px;font-size:11px;line-height:1.6;margin:0 0 14px}
-.application-track{padding:14px;border:1px solid #203b4f;background:#0b1b29;border-radius:13px;margin-bottom:10px}.application-track-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}.application-track-head strong{display:block;font-size:13px}.application-track-head small{display:block;color:var(--muted);font-size:10px;margin-top:3px}.application-amounts{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0;font-size:10px;color:var(--muted)}.application-amounts b{display:block;color:var(--text);font-size:12px;margin-top:3px}.timeline{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:5px;margin:14px 0 10px}.timeline-step{display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;color:#718799;font-size:9px;position:relative}.timeline-step i{width:12px;height:12px;border-radius:50%;border:2px solid #385064;background:#0b1b29;z-index:1}.timeline-step.done{color:var(--green)}.timeline-step.done i{background:var(--green);border-color:var(--green);box-shadow:0 0 0 3px #59e1ae20}.application-status-copy{font-size:11px;color:#b8cbd8;margin:10px 0 0}.admin-note{background:#1a2b37;border-radius:8px;padding:9px;font-size:11px;color:#d9e8f1;margin:10px 0 0}.status-pending{background:#243544}.status-approved,.status-disbursed,.status-active{background:#103a30;color:#7cf0c0}.status-rejected,.status-need_documents{background:#3b2025;color:#ffd1d1}
-@media(max-width:760px){.products-grid{grid-template-columns:1fr}.cards-loans-panel{grid-column:auto}.product-card,.product-summary,.product-empty{padding:15px}.timeline-step{font-size:8px}.application-amounts{gap:12px}}
-
-/* Deposit, withdrawal and statement styles */
-.statement-panel{grid-column:1/-1}.statement-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.statement-summary{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 14px;padding:12px;border:1px solid var(--line);border-radius:10px;background:#071521;color:var(--muted);font-size:12px}.statement-summary b{color:var(--text);margin-left:5px}.statement-table-wrap{overflow-x:auto;margin-bottom:14px;border:1px solid var(--line);border-radius:10px}.statement-table{width:100%;border-collapse:collapse;font-size:12px;min-width:680px}.statement-table th,.statement-table td{padding:11px 12px;text-align:left;border-bottom:1px solid #ffffff10;white-space:nowrap}.statement-table th{color:var(--muted);font-weight:700;background:#071521}.statement-table td:nth-child(2){white-space:normal;min-width:190px}.statement-table tbody tr:last-child td{border-bottom:0}.statement-table tbody td[colspan]{color:var(--muted);text-align:center;padding:20px}.statement-panel>#exportStatement{width:auto}@media(max-width:760px){.statement-filters{grid-template-columns:1fr}.statement-panel{grid-column:auto}.statement-summary{gap:10px;flex-direction:column}}
-
-/* Admin-reviewed deposit and withdrawal requests */
-.money-request-manager{margin-top:26px;padding-top:22px;border-top:1px solid #ffffff18}.money-review-card{padding:14px;border:1px solid var(--line);border-radius:12px;background:#0a1926;margin:10px 0}.money-review-card label{margin:10px 0}.money-review-card .review-controls .btn{width:auto;flex:1}.money-request-item{flex-wrap:wrap}.status-pending{background:#3b3423;color:#ffe4a3}.status-approved{background:#10372f;color:#8fffd3}.status-rejected{background:#3b2025;color:#ffd1d1}.status-processing{background:#1e3046;color:#b8d9ff}
-
-/* Admin customer management */
-.customer-search-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;margin:12px 0}.customer-search-row input{margin:0}.admin-customer-card{border:1px solid var(--line);background:#0a1a28;border-radius:12px;padding:12px;margin:8px 0}.customer-action-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end;margin-top:8px}.customer-action-row label{margin:0}.customer-action-row button{white-space:nowrap}.status-rejected{background:#46262b;color:#ffc3c3}.status-active{background:#10372f;color:var(--green)}@media(max-width:600px){.customer-search-row,.customer-action-row{grid-template-columns:1fr}.customer-action-row button{width:100%}}
+/* NovaBank dashboard quick navigation */
+.quick-nav{display:flex;gap:10px;flex-wrap:wrap;position:sticky;top:8px;z-index:5;margin:0 0 22px;padding:10px;background:rgba(8,20,33,.94);border:1px solid var(--border,#20384a);border-radius:14px;backdrop-filter:blur(12px)}
+.quick-nav a{color:var(--muted,#9db3c7);text-decoration:none;padding:9px 13px;border-radius:9px;font-size:.9rem;font-weight:650;border:1px solid transparent}
+.quick-nav a:hover,.quick-nav a:focus{color:var(--green,#50dfb0);border-color:rgba(80,223,176,.35);background:rgba(80,223,176,.08)}
+.closure-review{display:grid;gap:10px;border:1px solid var(--border,#20384a);border-radius:12px;padding:14px;margin:10px 0}
+@media(max-width:640px){.quick-nav{position:static;gap:6px}.quick-nav a{font-size:.82rem;padding:8px 9px}}
