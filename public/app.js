@@ -1,14 +1,59 @@
 const $=s=>document.querySelector(s);
 let token=localStorage.getItem("novabank_token")||"", me=null, accounts=[], verifiedRecipient="";
 const money=cents=>(Number(cents||0)/100).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+function setupCustomerViews(){
+ const dashboard=$("#dashboard"), nav=$("#customerNav"); if(!dashboard||!nav||$("#view-overview"))return;
+ const viewDefs=[
+  ["overview","Overview"],["transactions","Transactions"],["cardsLoans","Cards & Loans"],["transferPayments","Transfer & Payments"],["yourRequests","Your Requests"],["accountInfo","Account Info"]
+ ];
+ const host=document.createElement("div");host.id="customerViews";
+ for(const [id,label] of viewDefs){const v=document.createElement("section");v.className="customer-view";v.id="view-"+id;v.dataset.view=id;v.setAttribute("aria-label",label);host.appendChild(v);}
+ const adminView=document.createElement("section");adminView.className="customer-view";adminView.id="view-admin";adminView.dataset.view="admin";host.appendChild(adminView);
+ const get=id=>$("#"+id); const move=(el,target)=>{if(el&&target)target.appendChild(el)};
+ const view=id=>get("view-"+id);
+ move(get("overview"),view("overview")); move(dashboard.querySelector(".overview-stats"),view("overview")); move(dashboard.querySelector(".offers-section"),view("overview"));
+ move(get("transactionsPanel"),view("transactions")); move(dashboard.querySelector(".statement-panel"),view("transactions"));
+ move(get("cardsLoansPanel"),view("cardsLoans"));
+ for(const formId of ["depositForm","withdrawForm","transferForm","billPaymentForm"]){const f=get(formId);move(f?.closest(".panel"),view("transferPayments"));}
+ // The bill form's panel is already moved above; avoid moving a duplicate panel.
+ const moneyPanel=get("moneyRequests")?.closest(".panel");move(moneyPanel,view("transferPayments"));
+ move(get("applicationsPanel"),view("yourRequests"));
+ move(get("accountInfoTitle")?.closest(".account-info-section"),view("accountInfo"));
+ const closureStrip=get("requestAccountClosure")?.closest(".account-closure-strip"); if(closureStrip)move(closureStrip,view("accountInfo"));
+ move(get("adminPanel"),view("admin"));
+ // Any unclassified panels are retained under their logical sections rather than appended to Overview.
+ const work=dashboard.querySelector(".work-grid"); if(work){for(const child of [...work.children]){if(child.classList.contains("panel")){const text=(child.querySelector("h3")?.textContent||"").toLowerCase();let target="transferPayments";if(text.includes("transaction")||text.includes("statement"))target="transactions";else if(text.includes("card")||text.includes("loan"))target="cardsLoans";else if(text.includes("application"))target="yourRequests";move(child,view(target));}}work.remove();}
+ dashboard.appendChild(host);
+ nav.querySelectorAll("a[data-view]").forEach(a=>a.addEventListener("click",e=>{e.preventDefault();showCustomerView(a.dataset.view,true);}));
+ const adminLink=document.createElement("a");adminLink.href="#admin";adminLink.dataset.view="admin";adminLink.textContent="Admin";adminLink.className="admin-nav-link hidden";adminLink.addEventListener("click",e=>{e.preventDefault();showCustomerView("admin",true);});nav.appendChild(adminLink);
+ showCustomerView(location.hash==="#transactions"?"transactions":location.hash==="#cardsLoans"?"cardsLoans":location.hash==="#transferPayments"?"transferPayments":location.hash==="#yourRequests"?"yourRequests":location.hash==="#accountInfo"?"accountInfo":"overview",false);
+}
+function showCustomerView(id,updateHash=true){
+ const views=document.querySelectorAll(".customer-view");if(!views.length)return;
+ const allowed=["overview","transactions","cardsLoans","transferPayments","yourRequests","accountInfo","admin"];
+ if(!allowed.includes(id))id="overview";
+ views.forEach(v=>v.classList.toggle("active-view",v.dataset.view===id));
+ document.querySelectorAll("#customerNav a[data-view]").forEach(a=>a.classList.toggle("active",a.dataset.view===id));
+ const adminLink=document.querySelector(".admin-nav-link");if(adminLink)adminLink.classList.toggle("hidden",me?.role!=="admin");
+ if(id==="admin"&&me?.role!=="admin")id="overview";
+ if(updateHash)history.replaceState(null,"",`#${id}`);
+ window.scrollTo({top:0,behavior:"smooth"});
+}
+function setPanelError(selector,message){const el=$(selector);if(el)el.innerHTML=`<p class="empty error-copy">${esc(message)}</p>`;}
+
 function notice(msg,error=false){const n=$("#notice");if(!n){console[error?"error":"log"](msg);return;}n.textContent=msg;n.classList.remove("hidden","error");if(error)n.classList.add("error");window.scrollTo({top:0,behavior:"smooth"});setTimeout(()=>n.classList.add("hidden"),6500)}
 async function api(path,opts={}){const headers={"content-type":"application/json",...(opts.headers||{})};if(token)headers.authorization="Bearer "+token;let res;try{res=await fetch("/api"+path,{...opts,headers});}catch(e){throw new Error("API se connection nahi ho pa raha. Cloudflare par deploy hone ke baad try karein.");}let data={};try{data=await res.json()}catch{}if(!res.ok)throw new Error(data.error||"Request failed");return data}
 function formData(form){return Object.fromEntries(new FormData(form).entries())}
-function setAuth(show){const auth=$("#authPanel"),dashboard=$("#dashboard"),logout=$("#logoutBtn");auth?.classList.toggle("hidden",!show);dashboard?.classList.toggle("hidden",show);logout?.classList.toggle("hidden",show)}
+function setAuth(show){const auth=$("#authPanel"),dashboard=$("#dashboard"),logout=$("#logoutBtn"),hero=document.querySelector(".hero");auth?.classList.toggle("hidden",!show);dashboard?.classList.toggle("hidden",show);logout?.classList.toggle("hidden",show);hero?.classList.toggle("auth-hero-hidden",!show);if(!show)setupCustomerViews();}
 $("#loginForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=await api("/login",{method:"POST",body:JSON.stringify(formData(e.target))});token=d.token;localStorage.setItem("novabank_token",token);await loadDashboard();notice("Welcome back to NovaBank.");}catch(err){notice(err.message,true)}});
 $("#registerForm").addEventListener("submit",async e=>{e.preventDefault();try{await api("/register",{method:"POST",body:JSON.stringify(formData(e.target))});e.target.reset();notice("Demo account created. Ab sign in karein.");}catch(err){notice(err.message,true)}});
 $("#logoutBtn").addEventListener("click",async()=>{try{await api("/logout",{method:"POST",body:"{}"})}catch{}token="";me=null;localStorage.removeItem("novabank_token");setAuth(true);notice("You have been logged out.");});
 async function verifyRecipient(){const input=$("#recipientAccountNumber"),status=$("#transferRecipientStatus");if(!input||!status)return false;const accountNumber=input.value.trim();verifiedRecipient="";status.className="";if(!accountNumber){status.textContent="Enter the account number to verify the registered demo account name.";return false;}status.textContent="Verifying demo account…";try{const result=await api(`/recipient-lookup?accountNumber=${encodeURIComponent(accountNumber)}`);verifiedRecipient=result.accountNumber;status.className="valid";status.textContent=`Verified recipient: ${result.recipientName} · ${result.accountNumber}`;return true;}catch(err){status.className="invalid";status.textContent=err.message;return false;}}
+
+async function fetchCardBill(){const last4=$("#billCardLast4")?.value.trim()||"",out=$("#billFetchResult");if(!/^[A-Za-z0-9]{4}$/.test(last4)){if(out)out.textContent="Enter the last four characters of your linked demo card.";return;}try{const d=await api(`/card-bill?last4=${encodeURIComponent(last4)}`);if(out){out.dataset.cardId=d.cardId;out.innerHTML=`<strong>${esc(d.cardName||"Nova Rewards Card")}</strong><br>Outstanding: N₹ ${money(d.outstanding)} · Available credit: N₹ ${money(d.availableCredit)}`;}const amount=$("#billPaymentAmount");if(amount)amount.max=String(Number(d.outstanding||0)/100);notice("Demo bill fetched.")}catch(e){if(out){out.dataset.cardId="";out.textContent=e.message}notice(e.message,true)}}
+$("#fetchCardBill")?.addEventListener("click",fetchCardBill);
+$("#billPaymentForm")?.addEventListener("submit",async e=>{e.preventDefault();const out=$("#billFetchResult"),cardId=out?.dataset.cardId||"";if(!cardId){notice("Fetch and verify your demo bill first.",true);return;}const amount=Number($("#billPaymentAmount")?.value||0);if(!Number.isFinite(amount)||amount<=0){notice("Enter a valid bill payment amount.",true);return;}try{const r=await api("/card-bill/pay",{method:"POST",body:JSON.stringify({cardId,amount})});e.target.reset();if(out){out.dataset.cardId="";out.textContent="Bill paid. Fetch another bill if needed."}await loadDashboard();notice(r.message||"Demo card bill paid.")}catch(err){notice(err.message,true)}});
+
 $("#recipientAccountNumber")?.addEventListener("blur",verifyRecipient);
 $("#recipientAccountNumber")?.addEventListener("input",()=>{verifiedRecipient="";const status=$("#transferRecipientStatus");if(status){status.className="";status.textContent="Verify the account number before transferring.";}});
 $("#transferForm").addEventListener("submit",async e=>{e.preventDefault();try{const input=$("#recipientAccountNumber");if(!verifiedRecipient||verifiedRecipient!==input.value.trim()){const ok=await verifyRecipient();if(!ok)throw new Error("Recipient account verify hone ke baad hi transfer proceed hoga.");}const d=formData(e.target);d.amount=Number(d.amount);const r=await api("/transfer",{method:"POST",body:JSON.stringify(d)});e.target.reset();verifiedRecipient="";await loadDashboard();notice(r.message)}catch(err){notice(err.message,true)}});
@@ -30,7 +75,7 @@ $("#loanForm").addEventListener("submit",async e=>{e.preventDefault();try{const 
 $("#cardForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);["monthlyIncome","monthlyExpenses","existingEmi","existingDebt","loanOutstanding"].forEach(k=>d[k]=Number(d[k]||0));const r=await api("/cards",{method:"POST",body:JSON.stringify(d)});e.target.reset();closeApplicationModal();await loadDashboard();notice(`${r.message} Suggested limit: N₹${money(r.suggestedLimit*100)}.`)}catch(err){notice(err.message,true)}});
 $("#refreshAdmin").addEventListener("click",()=>Promise.all([loadAdmin(),loadMoneyRequests(),loadClosureRequests()]).catch(e=>notice(e.message,true)));
 $("#offerForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);await api("/admin/offers",{method:"POST",body:JSON.stringify(d)});e.target.reset();await loadOffers();notice("Demo offer published.");}catch(err){notice(err.message,true)}});
-async function loadOffers(){let d;try{d=await api("/offers")}catch(e){const g=$("#offersGrid");if(g)g.innerHTML=`<p class="load-error">Offers could not load: ${esc(e.message)}</p>`;throw e;}const offers=d.offers||[];const grid=$("#offersGrid");grid.innerHTML=offers.filter(x=>me?.role==="admin"||Number(x.active)===1).map(x=>`<article class="offer-card"><div class="offer-top"><span class="offer-category">${esc(x.category)}</span><span class="offer-star">✦</span></div><h3>${esc(x.title)}</h3><p>${esc(x.description)}</p>${x.benefit?`<div class="offer-benefit">${esc(x.benefit)}</div>`:""}<button class="btn ${x.category==="Personal Loan"?"primary":"secondary"}" type="button" onclick="offerAction('${esc(x.category)}')">${esc(x.cta_label||"Explore offer")} →</button></article>`).join("")||'<p class="empty">No active offers right now.</p>';
+async function loadOffers(){const d=await api("/offers");const offers=d.offers||[];const grid=$("#offersGrid");grid.innerHTML=offers.filter(x=>me?.role==="admin"||Number(x.active)===1).map(x=>`<article class="offer-card"><div class="offer-top"><span class="offer-category">${esc(x.category)}</span><span class="offer-star">✦</span></div><h3>${esc(x.title)}</h3><p>${esc(x.description)}</p>${x.benefit?`<div class="offer-benefit">${esc(x.benefit)}</div>`:""}<button class="btn ${x.category==="Personal Loan"?"primary":"secondary"}" type="button" onclick="offerAction('${esc(x.category)}')">${esc(x.cta_label||"Explore offer")} →</button></article>`).join("")||'<p class="empty">No active offers right now.</p>';
 const admin=$("#adminOffers");if(admin)admin.innerHTML=me?.role==="admin"?offers.map(x=>`<div class="activity-item"><div><strong>${esc(x.title)}</strong><small>${esc(x.category)} · ${Number(x.active)===1?"Active":"Inactive"}</small></div><button class="btn ghost" type="button" onclick="toggleOffer('${esc(x.id)}',${Number(x.active)===1?"false":"true"})">${Number(x.active)===1?"Deactivate":"Activate"}</button></div>`).join(""):'<p class="empty">Admin access required.</p>';
 }
 function openApplicationModal(type){
@@ -74,10 +119,13 @@ function renderAccountInfo(){
   if($("#infoCustomerId"))$("#infoCustomerId").textContent = me?.id ? String(me.id).slice(0,8).toUpperCase() : "—";
   if($("#infoAccountNumber"))$("#infoAccountNumber").textContent = account.account_number || "No account found";
   if($("#infoAccountType"))$("#infoAccountType").textContent = account.account_type || account.type || "Everyday Demo Account";
-  if($("#infoAccountStatus"))$("#infoAccountStatus").innerHTML = `<span class="status ${account.status==="active"?"status-active":""}">${esc(account.status || "Unknown")}</span>`;
+  $("#infoAccountStatus").innerHTML = `<span class="status ${account.status==="active"?"status-active":""}">${esc(account.status || "Unknown")}</span>`;
   if($("#infoOpenedAt"))$("#infoOpenedAt").textContent = displayDate(account.opened_at || account.created_at);
   if($("#infoBalance"))$("#infoBalance").textContent = "N₹ " + money(accounts.reduce((sum,a)=>sum+Number(a.balance||0),0));
 }
+
+$("#requestAccountClosure")?.addEventListener("click",async()=>{if(!confirm("Request closure of this fictional demo account? Admin review is required and transaction history will be retained."))return;try{const r=await api("/account-closure-requests",{method:"POST",body:"{}"});await loadDashboard();notice(r.message||"Account closure request submitted.");showCustomerView("yourRequests",false)}catch(e){notice(e.message,true)}});
+
 $("#copyAccountNumber")?.addEventListener("click",async()=>{
   const accountNumber = accounts[0]?.account_number;
   if(!accountNumber){notice("Account number is not available.",true);return;}
@@ -85,71 +133,45 @@ $("#copyAccountNumber")?.addEventListener("click",async()=>{
   catch{ notice("Copy is unavailable in this browser. Account number: " + accountNumber, true); }
 });
 async function loadDashboard(){
-  const d=await api("/me"); me=d.user; setAuth(false);
-  const userName=$("#userName"),roleBadge=$("#roleBadge"),adminPanel=$("#adminPanel");
-  if(userName)userName.textContent=me.display_name||me.displayName||me.username;
-  if(roleBadge)roleBadge.textContent=(me.role||"customer").toUpperCase();
-  adminPanel?.classList.toggle("hidden",me.role!=="admin");
-  setupSeparateViews();
-  const read=async(path,fallback,selector,label)=>{
-    try{return await api(path)}catch(err){
-      const el=selector?$(selector):null;
-      if(el)el.innerHTML=`<p class="load-error">${esc(label)} could not load: ${esc(err.message)}. Please refresh or contact the demo administrator.</p>`;
-      return fallback;
-    }
-  };
-  const [a,t,l,c,p]=await Promise.all([
-    read("/accounts",{accounts:[]},null,"Accounts"),
-    read("/transactions",{transactions:[]},"#transactions","Transactions"),
-    read("/loans",{applications:[]},"#applications","Loan applications"),
-    read("/cards",{applications:[]},"#applications","Card applications"),
-    read("/products",{loans:[],cards:[]},"#productsGrid","Cards and loans")
-  ]);
-  accounts=a.accounts||[]; const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);
-  const balanceEl=$("#balance"),heroBalance=$("#heroBalance"),txCount=$("#txCount"),loanCount=$("#loanCount"),cardCount=$("#cardCount");
-  if(balanceEl)balanceEl.textContent=money(total); if(heroBalance)heroBalance.textContent=money(total); renderAccountInfo();
-  if(txCount)txCount.textContent=(t.transactions||[]).length; if(loanCount)loanCount.textContent=(l.applications||[]).length; if(cardCount)cardCount.textContent=(c.applications||[]).length;
-  const accountNumberEl=$("#accountNumber"),fromAccountEl=$("#fromAccount");
-  if(accountNumberEl)accountNumberEl.textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";
-  const accountOptions=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
-  if(fromAccountEl)fromAccountEl.innerHTML=accountOptions;
-  ["#depositAccount","#withdrawAccount"].forEach(sel=>{if($(sel))$(sel).innerHTML=accountOptions});
-  const txBox=$("#transactions"); if(txBox)txBox.innerHTML=(t.transactions||[]).slice(0,8).map(x=>`<div class="activity-item"><div><strong>${esc(x.description||x.type)}</strong><small>${esc(x.created_at||"")}</small></div><span class="amount ${String(x.type).includes("in")||x.type==="deposit"?"positive":"negative"}">${String(x.type).includes("in")||x.type==="deposit"?"+":"−"} N₹${money(x.amount)}</span></div>`).join("")||'<p class="empty">No transactions yet.</p>';
-  window.__transactions=t.transactions||[]; renderStatement(window.__transactions);
-  renderApplications(l.applications||[],c.applications||[]); renderProducts(p,l.applications||[],c.applications||[]);
-  const liveLoans=(p.loans||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));
-  const liveCards=(p.cards||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));
-  if($("#overviewCreditOutstanding"))$("#overviewCreditOutstanding").textContent=liveCards.length?`N₹ ${money(liveCards.reduce((n,x)=>n+Number(x.outstanding||0),0))}`:"No card yet";
-  if($("#overviewLoanOutstanding"))$("#overviewLoanOutstanding").textContent=liveLoans.length?`N₹ ${money(liveLoans.reduce((n,x)=>n+Number(x.outstanding_amount||0),0))}`:"No active loan";
-  if($("#overviewCreditAction"))$("#overviewCreditAction").textContent=liveCards.length?"View credit card":"Apply for credit card";
-  if($("#overviewLoanAction"))$("#overviewLoanAction").textContent=liveLoans.length?"View loan details":"Explore loans";
-  await Promise.allSettled([loadOffers(),loadMoneyRequests(),loadClosureRequests()]);
-  if(me.role==="admin")await loadAdmin().catch(e=>notice("Admin data could not load: "+e.message,true));
-  applyCurrentView();
+ const d=await api("/me");me=d.user;setAuth(false);
+ const userName=$("#userName"),roleBadge=$("#roleBadge"),adminPanel=$("#adminPanel");
+ if(userName)userName.textContent=me.display_name||me.displayName||me.username;
+ if(roleBadge)roleBadge.textContent=(me.role||"customer").toUpperCase();
+ adminPanel?.classList.toggle("hidden",me.role!=="admin");
+ const navAdmin=document.querySelector(".admin-nav-link");navAdmin?.classList.toggle("hidden",me.role!=="admin");
+ const fetchSafe=async(path,selector,fallback)=>{try{return await api(path)}catch(err){setPanelError(selector,`${fallback} Could not load: ${err.message}`);return null}};
+ const [a,t,l,c,p]=await Promise.all([
+  fetchSafe("/accounts","#infoAccountNumber","Account details"),
+  fetchSafe("/transactions","#transactions","Transactions"),
+  fetchSafe("/loans","#applications","Loan applications"),
+  fetchSafe("/cards","#applications","Card applications"),
+  fetchSafe("/products","#productsGrid","Cards and loans")
+ ]);
+ accounts=a?.accounts||[];const tx=t?.transactions||[],loans=l?.applications||[],cards=c?.applications||[],products=p||{loans:[],cards:[]};
+ const total=accounts.reduce((sum,x)=>sum+Number(x.balance||0),0);
+ if($("#balance"))$("#balance").textContent=money(total);if($("#heroBalance"))$("#heroBalance").textContent=money(total);renderAccountInfo();
+ if($("#txCount"))$("#txCount").textContent=tx.length;
+ const accountNumberEl=$("#accountNumber");if(accountNumberEl)accountNumberEl.textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";
+ const accountOptions=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
+ ["#fromAccount","#depositAccount","#withdrawAccount"].forEach(sel=>{if($(sel))$(sel).innerHTML=accountOptions});
+ const txBox=$("#transactions");if(txBox)txBox.innerHTML=tx.slice(0,100).map(x=>`<div class="activity-item"><div><strong>${esc(x.description||x.type)}</strong><small>${esc(x.created_at||"")}</small></div><span class="amount ${transactionDirection(x)==="credit"?"positive":"negative"}">${transactionDirection(x)==="credit"?"+":"−"} N₹${money(x.amount)}</span></div>`).join("")||'<p class="empty">No transactions yet.</p>';
+ window.__transactions=tx;renderStatement(tx);
+ renderApplications(loans,cards);renderProducts(products,loans,cards);
+ const liveLoans=(products.loans||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));const liveCards=(products.cards||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));
+ if($("#overviewCreditOutstanding"))$("#overviewCreditOutstanding").textContent=liveCards.length?`N₹ ${money(liveCards.reduce((n,x)=>n+Number(x.outstanding||0),0))}`:"No card yet";
+ if($("#overviewLoanOutstanding"))$("#overviewLoanOutstanding").textContent=liveLoans.length?`N₹ ${money(liveLoans.reduce((n,x)=>n+Number(x.outstanding_amount||0),0))}`:"No active loan";
+ if($("#overviewCreditAction"))$("#overviewCreditAction").textContent=liveCards.length?"View credit card":"Apply for credit card";
+ if($("#overviewLoanAction"))$("#overviewLoanAction").textContent=liveLoans.length?"View loan details":"Explore loans";
+ // Each non-critical area loads independently so one failing endpoint cannot freeze the rest.
+ const jobs=[
+  ["Offers","#offersGrid",loadOffers],
+  ["Deposit/withdrawal requests","#moneyRequests",loadMoneyRequests],
+  ["Closure requests","#customerClosureRequests",loadClosureRequests]
+ ];
+ for(const [label,selector,fn] of jobs){try{await fn()}catch(err){setPanelError(selector,`${label} could not load: ${err.message}`)}}
+ if(me.role==="admin"){try{await loadAdmin()}catch(err){setPanelError("#adminQueue",`Admin queue could not load: ${err.message}`)}}
+ showCustomerView(location.hash.replace(/^#/,"")||"overview",false);
 }
-function setupSeparateViews(){
-  const nav=$(".quick-nav"); if(!nav||nav.dataset.ready)return; nav.dataset.ready="1";
-  nav.innerHTML=`<a href="#overview" data-view="overview">Overview</a><a href="#transactionsPanel" data-view="transactions">Transactions</a><a href="#cardsLoansPanel" data-view="products">Cards &amp; Loans</a><a href="#transferForm" data-view="transfer">Transfer &amp; Payments</a><a href="#applicationsPanel" data-view="requests">Your Requests</a><a href="#accountInfoTitle" data-view="account">Account Info</a>`;
-  nav.addEventListener("click",e=>{const link=e.target.closest("a[data-view]");if(!link)return;e.preventDefault();history.replaceState(null,"",link.getAttribute("href"));applyCurrentView(link.dataset.view);window.scrollTo({top:0,behavior:"smooth"})});
-}
-function applyCurrentView(forced){
-  const nav=$(".quick-nav"); if(!nav)return; const hash=location.hash||"#overview";
-  const map={"#overview":"overview","#transactionsPanel":"transactions","#cardsLoansPanel":"products","#transferForm":"transfer","#applicationsPanel":"requests","#accountInfoTitle":"account","#transactions":"transactions","#transfer":"transfer"};
-  const view=forced||map[hash]||"overview";
-  const all=Array.from(document.querySelectorAll("#dashboard .panel, #dashboard .account-info-section, #dashboard .offers-section, #dashboard .work-grid"));
-  all.forEach(el=>el.classList.add("view-hidden"));
-  const show=sel=>{const el=$(sel);if(el)el.classList.remove("view-hidden")};
-  if(view==="overview"){show("#overview");show(".overview-stats");show(".offers-section");}
-  if(view==="transactions"){show("#transactionsPanel");show(".statement-panel");}
-  if(view==="products"){show("#cardsLoansPanel");}
-  if(view==="transfer"){["#transferForm","#depositForm","#withdrawForm"].forEach(sel=>{const form=$(sel);if(form){const section=form.closest("section");section?.classList.remove("view-hidden")}});}
-  if(view==="requests"){show("#applicationsPanel");const req=$("#moneyRequests")?.closest("section");req?.classList.remove("view-hidden");const closure=$("#customerClosureRequests")?.closest("section");closure?.classList.remove("view-hidden");}
-  if(view==="account")show(".account-info-section");
-  if(me?.role==="admin"&&view==="admin")show("#adminPanel");
-  nav.querySelectorAll("a[data-view]").forEach(a=>a.classList.toggle("active",a.dataset.view===view));
-  if(view!=="admin")$("#adminPanel")?.classList.add("view-hidden");
-}
-
 function transactionDirection(x){const t=String(x.type||"").toLowerCase();return (t.includes("in")||["deposit","loan_disbursement","refund","credit"].includes(t))?"credit":"debit"}
 function filteredStatement(rows){const from=$("#statementFrom")?.value||"",to=$("#statementTo")?.value||"",type=$("#statementType")?.value||"all";return rows.filter(x=>{const date=String(x.created_at||"").slice(0,10);return (!from||date>=from)&&(!to||date<=to)&&(type==="all"||transactionDirection(x)===type)}).sort((a,b)=>String(b.created_at||"").localeCompare(String(a.created_at||"")))}
 function renderStatement(rows){const filtered=filteredStatement(rows||[]);const credits=filtered.filter(x=>transactionDirection(x)==="credit").reduce((n,x)=>n+Number(x.amount||0),0);const debits=filtered.filter(x=>transactionDirection(x)==="debit").reduce((n,x)=>n+Number(x.amount||0),0);const summary=$("#statementSummary");if(summary)summary.innerHTML=`<span>Entries <b>${filtered.length}</b></span><span>Credits <b class="positive">N₹ ${money(credits)}</b></span><span>Debits <b class="negative">N₹ ${money(debits)}</b></span>`;const tbody=$("#statementRows");if(!tbody)return;tbody.innerHTML=filtered.map(x=>`<tr><td>${esc(displayDate(x.created_at)||"—")}</td><td>${esc(x.description||x.type||"Transaction")}</td><td>${esc(String(x.type||"").replaceAll("_"," "))}</td><td class="${transactionDirection(x)==="credit"?"positive":"negative"}">${transactionDirection(x)==="credit"?"+":"−"} N₹ ${money(x.amount)}</td><td>N₹ ${money(x.balance_after)}</td></tr>`).join("")||'<tr><td colspan="5">No transactions match these filters.</td></tr>'}
@@ -160,7 +182,7 @@ function statusInfo(status){
 }
 function renderApplications(loans,cards){
  const items=[...loans.map(x=>({...x,kind:"Loan",amount:x.requested_amount,approved:x.sanctioned_amount,submitted:x.created_at,note:x.admin_note,unit:"loan"})),...cards.map(x=>({...x,kind:"Credit card",amount:x.requested_limit,approved:x.sanctioned_limit,submitted:x.created_at,note:x.admin_note,unit:"card"}))].sort((a,b)=>String(b.submitted||"").localeCompare(String(a.submitted||"")));
- if($("#applications"))$("#applications").innerHTML=items.map(x=>{const info=statusInfo(x.status);const isLoan=x.unit==="loan";const requested=isLoan?money(x.amount):"Bank assessment";const sanctioned=x.approved==null?"Not decided":money(x.approved);const stages=isLoan?["pending","verified","approved","disbursed"]:["pending","verified","approved","active"];const pos=stages.indexOf(x.status);const stageIndex=x.status==="need_documents"?1:x.status==="rejected"?-1:Math.max(0,pos);return `<article class="application-track"><div class="application-track-head"><div><strong>${x.kind}</strong><small>Submitted ${esc(displayDate(x.submitted))}</small></div><span class="status status-${esc(x.status)}">${esc(info[0])}</span></div><div class="application-amounts"><span>Requested <b>N₹ ${requested}</b></span><span>${isLoan?"Sanctioned amount":"Sanctioned limit"} <b>${x.approved==null?"—":"N₹ "+sanctioned}</b></span></div><div class="timeline">${stages.map((s,i)=>`<div class="timeline-step ${x.status!=="rejected"&&i<=stageIndex?"done":""}"><i></i><span>${esc(statusInfo(s)[0])}</span></div>`).join("")}</div><p class="application-status-copy">${esc(info[1])}</p>${x.note?`<p class="admin-note"><b>Review note:</b> ${esc(x.note)}</p>`:""}${isLoan&&x.status==="approved"?`<button class="btn primary full-btn" type="button" onclick="acceptDemoLoan('${esc(x.id)}')">Accept &amp; disburse demo loan →</button>`:""}</article>`}).join("")||'<p class="empty">No applications yet. Explore Offers for You to apply for a demo loan or credit card.</p>';
+ $("#applications").innerHTML=items.map(x=>{const info=statusInfo(x.status);const isLoan=x.unit==="loan";const requested=isLoan?money(x.amount):"Bank assessment";const sanctioned=x.approved==null?"Not decided":money(x.approved);const stages=isLoan?["pending","verified","approved","disbursed"]:["pending","verified","approved","active"];const pos=stages.indexOf(x.status);const stageIndex=x.status==="need_documents"?1:x.status==="rejected"?-1:Math.max(0,pos);return `<article class="application-track"><div class="application-track-head"><div><strong>${x.kind}</strong><small>Submitted ${esc(displayDate(x.submitted))}</small></div><span class="status status-${esc(x.status)}">${esc(info[0])}</span></div><div class="application-amounts"><span>Requested <b>N₹ ${requested}</b></span><span>${isLoan?"Sanctioned amount":"Sanctioned limit"} <b>${x.approved==null?"—":"N₹ "+sanctioned}</b></span></div><div class="timeline">${stages.map((s,i)=>`<div class="timeline-step ${x.status!=="rejected"&&i<=stageIndex?"done":""}"><i></i><span>${esc(statusInfo(s)[0])}</span></div>`).join("")}</div><p class="application-status-copy">${esc(info[1])}</p>${x.note?`<p class="admin-note"><b>Review note:</b> ${esc(x.note)}</p>`:""}${isLoan&&x.status==="approved"?`<button class="btn primary full-btn" type="button" onclick="acceptDemoLoan('${esc(x.id)}')">Accept &amp; disburse demo loan →</button>`:""}</article>`}).join("")||'<p class="empty">No applications yet. Explore Offers for You to apply for a demo loan or credit card.</p>';
 }
 function renderProducts(products,loans,cards){
  const account=accounts[0];const debit=account?`<article class="product-card debit-product"><div class="product-card-top"><span class="product-chip">DEBIT · DEMO</span><span class="product-status">${esc(account.status||"active")}</span></div><div class="demo-card-brand">Nova<span>Bank</span></div><div class="masked-card-number">•••• &nbsp;•••• &nbsp;•••• &nbsp;${esc(String(account.account_number||"").slice(-4))}</div><div class="product-card-bottom"><div><small>ACCOUNT HOLDER</small><b>${esc(me?.display_name||me?.displayName||me?.username||"Customer")}</b></div><div><small>LINKED ACCOUNT</small><b>${esc(String(account.account_number||""))}</b></div></div><p class="tiny muted">Fictional debit card preview only. No real card number or payment network.</p></article>`:`<div class="product-empty"><h4>Demo debit card</h4><p>No account is linked yet.</p></div>`;
@@ -207,10 +229,14 @@ $("#customerSearch")?.addEventListener("input",()=>{clearTimeout(window.__custom
 async function loadAdmin(){const [l,c]=await Promise.all([api("/loans"),api("/cards")]);await loadAdminCustomers();const items=[...(l.applications||[]).map(x=>({...x,kind:"loans",amount:x.requested_amount,limitName:"sanctionedAmount"})),...(c.applications||[]).map(x=>({...x,kind:"cards",amount:x.requested_limit,limitName:"sanctionedLimit"}))];$("#adminQueue").innerHTML=items.map(x=>`<div class="activity-item" style="display:block"><div><strong>${esc(x.kind==="loans"?"Loan":"Virtual card")} · ${esc(x.display_name||x.username||"Customer")}</strong><small>Requested N₹${money(x.amount)} · Suggested N₹${money(x.eligible_suggestion??x.suggested_limit)} · ${esc(x.created_at)}</small><span class="status">${esc(x.status)}</span></div><div class="review-controls"><select id="status-${esc(x.id)}"><option value="verified">Verify</option><option value="need_documents">Need documents</option><option value="approved">Approve</option><option value="rejected">Reject</option></select><input id="amount-${esc(x.id)}" type="number" min="1" placeholder="Final sanctioned N₹" title="Set the final amount/limit after reviewing affordability"><input id="note-${esc(x.id)}" placeholder="Admin note / reason"><button class="btn secondary" onclick="reviewApp('${esc(x.kind)}','${esc(x.id)}','${x.limitName}')">Save review</button></div></div>`).join("")||'<p class="empty">No applications in the queue.</p>'}
 window.reviewApp=async(kind,id,limitName)=>{try{const status=$("#status-"+id).value, amount=Number($("#amount-"+id).value||0), note=$("#note-"+id).value;const d={status,note};if(status==="approved")d[limitName]=amount;await api(`/admin/${kind}/${id}/review`,{method:"POST",body:JSON.stringify(d)});await loadDashboard();notice("Application review saved and customer notified.")}catch(e){notice(e.message,true)}};
 async function loadClosureRequests(){
- const d=await api("/closure-requests"), rows=d.requests||[];
- const customerBox=$("#customerClosureRequests"); if(customerBox) customerBox.innerHTML=rows.filter(x=>x.user_id===me?.id || me?.role!=="admin").map(x=>`<article class="activity-item"><div><strong>${esc(x.product_type==="loan"?"Loan foreclosure":"Credit card closure")} · ${esc(x.status)}</strong><small>Ref: ${esc(x.id)} · ${esc(x.created_at||"")}</small>${x.admin_note?`<small>Admin note: ${esc(x.admin_note)}</small>`:""}</div><span class="status status-${esc(x.status)}">${esc(x.status)}</span></article>`).join("")||'<p class="empty">No product closure requests yet.</p>';
- const adminBox=$("#adminClosureRequests"); if(adminBox&&me?.role==="admin") adminBox.innerHTML=rows.map(x=>`<article class="activity-item closure-review"><div><strong>${esc(x.product_type==="loan"?"Loan foreclosure":"Card closure")} · ${esc(x.display_name||x.username||"Customer")}</strong><small>Request ${esc(x.id)} · Product ${esc(x.product_id)}</small><small>Paid toward foreclosure: N₹${money(x.amount_paid||0)} · ${esc(x.created_at||"")}</small></div><span class="status status-${esc(x.status)}">${esc(x.status)}</span>${x.status==="pending"?`<input id="closure-note-${esc(x.id)}" maxlength="250" placeholder="Admin decision note (optional)"><div class="review-controls"><button class="btn primary" type="button" onclick="reviewClosure('${esc(x.id)}','approved')">Approve &amp; close</button><button class="btn ghost" type="button" onclick="reviewClosure('${esc(x.id)}','rejected')">Reject</button></div>`:x.admin_note?`<small>Note: ${esc(x.admin_note)}</small>`:""}</article>`).join("")||'<p class="empty">No closure requests yet.</p>';
+ const [productResult,accountResult]=await Promise.all([api("/closure-requests"),api("/account-closure-requests")]);
+ const rows=productResult.requests||[], accountRows=accountResult.requests||[];
+ const customerBox=$("#customerClosureRequests"); if(customerBox) customerBox.innerHTML=[...rows.map(x=>`<article class="activity-item"><div><strong>${esc(x.product_type==="loan"?"Loan foreclosure":"Credit card closure")} · ${esc(x.status)}</strong><small>Ref: ${esc(x.id)} · ${esc(x.created_at||"")}</small>${x.admin_note?`<small>Admin note: ${esc(x.admin_note)}</small>`:""}</div><span class="status status-${esc(x.status)}">${esc(x.status)}</span></article>`),...accountRows.map(x=>`<article class="activity-item"><div><strong>Account closure · ${esc(x.status)}</strong><small>Ref: ${esc(x.id)} · ${esc(x.created_at||"")}</small>${x.admin_note?`<small>Admin note: ${esc(x.admin_note)}</small>`:""}</div><span class="status status-${esc(x.status)}">${esc(x.status)}</span></article>`)].join("")||'<p class="empty">No closure requests yet.</p>';
+ const adminBox=$("#adminClosureRequests"); if(adminBox&&me?.role==="admin") adminBox.innerHTML=rows.map(x=>`<article class="activity-item closure-review"><div><strong>${esc(x.product_type==="loan"?"Loan foreclosure":"Card closure")} · ${esc(x.display_name||x.username||"Customer")}</strong><small>Request ${esc(x.id)} · Product ${esc(x.product_id)}</small><small>Paid toward foreclosure: N₹${money(x.amount_paid||0)} · ${esc(x.created_at||"")}</small></div><span class="status status-${esc(x.status)}">${esc(x.status)}</span>${x.status==="pending"?`<input id="closure-note-${esc(x.id)}" maxlength="250" placeholder="Admin decision note (optional)"><div class="review-controls"><button class="btn primary" type="button" onclick="reviewClosure('${esc(x.id)}','approved')">Approve &amp; close</button><button class="btn ghost" type="button" onclick="reviewClosure('${esc(x.id)}','rejected')">Reject</button></div>`:x.admin_note?`<small>Note: ${esc(x.admin_note)}</small>`:""}</article>`).join("")||'<p class="empty">No product closure requests yet.</p>';
+ const adminAccounts=$("#adminAccountClosureRequests"); if(adminAccounts&&me?.role==="admin")adminAccounts.innerHTML=accountRows.map(x=>`<article class="activity-item closure-review"><div><strong>${esc(x.display_name||x.username||"Customer")} · Account closure</strong><small>Request ${esc(x.id)} · ${esc(x.created_at||"")}</small></div><span class="status status-${esc(x.status)}">${esc(x.status)}</span>${x.status==="pending"?`<input id="account-closure-note-${esc(x.id)}" maxlength="250" placeholder="Decision note"><div class="review-controls"><button class="btn primary" type="button" onclick="reviewAccountClosure('${esc(x.id)}','approved')">Approve closure</button><button class="btn ghost" type="button" onclick="reviewAccountClosure('${esc(x.id)}','rejected')">Reject</button></div>`:x.admin_note?`<small>Note: ${esc(x.admin_note)}</small>`:""}</article>`).join("")||'<p class="empty">No account closure requests.</p>';
 }
+window.reviewAccountClosure=async(id,status)=>{try{const note=$("#account-closure-note-"+id)?.value||"";const r=await api(`/admin/account-closure-requests/${encodeURIComponent(id)}/review`,{method:"POST",body:JSON.stringify({status,note})});await loadDashboard();notice(r.message||`Account closure ${status}.`)}catch(e){notice(e.message,true)}};
+
 window.requestLoanClosure=async(id,amount)=>{if(!confirm(`Request one-time full foreclosure of N₹${Number(amount).toLocaleString("en-IN",{minimumFractionDigits:2})}? The full amount will be deducted from your demo balance and the loan will close after admin approval.`))return;try{const r=await api(`/loans/${encodeURIComponent(id)}/closure-request`,{method:"POST",body:"{}"});await loadDashboard();notice(r.message||"Foreclosure request submitted.")}catch(e){notice(e.message,true)}};
 window.requestCardClosure=async(id,outstanding)=>{if(Number(outstanding)>0){notice(`Please clear card dues of N₹${Number(outstanding).toLocaleString("en-IN",{minimumFractionDigits:2})} before requesting closure.`,true);return;}if(!confirm("Submit a card closure request? Admin approval is required."))return;try{const r=await api(`/cards/${encodeURIComponent(id)}/closure-request`,{method:"POST",body:"{}"});await loadDashboard();notice(r.message||"Card closure request submitted.")}catch(e){notice(e.message,true)}};
 window.reviewClosure=async(id,status)=>{try{const note=$("#closure-note-"+id)?.value||"";const r=await api(`/admin/closure-requests/${encodeURIComponent(id)}/review`,{method:"POST",body:JSON.stringify({status,note})});await loadDashboard();notice(r.message||`Closure ${status}.`)}catch(e){notice(e.message,true)}};
