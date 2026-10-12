@@ -1,10 +1,10 @@
 const $=s=>document.querySelector(s);
 let token=localStorage.getItem("novabank_token")||"", me=null, accounts=[], verifiedRecipient="";
 const money=cents=>(Number(cents||0)/100).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
-function notice(msg,error=false){const n=$("#notice");n.textContent=msg;n.classList.remove("hidden","error");if(error)n.classList.add("error");window.scrollTo({top:0,behavior:"smooth"});setTimeout(()=>n.classList.add("hidden"),6500)}
+function notice(msg,error=false){const n=$("#notice");if(!n){console[error?"error":"log"](msg);return;}n.textContent=msg;n.classList.remove("hidden","error");if(error)n.classList.add("error");window.scrollTo({top:0,behavior:"smooth"});setTimeout(()=>n.classList.add("hidden"),6500)}
 async function api(path,opts={}){const headers={"content-type":"application/json",...(opts.headers||{})};if(token)headers.authorization="Bearer "+token;let res;try{res=await fetch("/api"+path,{...opts,headers});}catch(e){throw new Error("API se connection nahi ho pa raha. Cloudflare par deploy hone ke baad try karein.");}let data={};try{data=await res.json()}catch{}if(!res.ok)throw new Error(data.error||"Request failed");return data}
 function formData(form){return Object.fromEntries(new FormData(form).entries())}
-function setAuth(show){$("#authPanel").classList.toggle("hidden",!show);$("#dashboard").classList.toggle("hidden",show);$("#logoutBtn").classList.toggle("hidden",show)}
+function setAuth(show){const auth=$("#authPanel"),dashboard=$("#dashboard"),logout=$("#logoutBtn");auth?.classList.toggle("hidden",!show);dashboard?.classList.toggle("hidden",show);logout?.classList.toggle("hidden",show)}
 $("#loginForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=await api("/login",{method:"POST",body:JSON.stringify(formData(e.target))});token=d.token;localStorage.setItem("novabank_token",token);await loadDashboard();notice("Welcome back to NovaBank.");}catch(err){notice(err.message,true)}});
 $("#registerForm").addEventListener("submit",async e=>{e.preventDefault();try{await api("/register",{method:"POST",body:JSON.stringify(formData(e.target))});e.target.reset();notice("Demo account created. Ab sign in karein.");}catch(err){notice(err.message,true)}});
 $("#logoutBtn").addEventListener("click",async()=>{try{await api("/logout",{method:"POST",body:"{}"})}catch{}token="";me=null;localStorage.removeItem("novabank_token");setAuth(true);notice("You have been logged out.");});
@@ -68,15 +68,15 @@ function displayDate(value){
 }
 function renderAccountInfo(){
   const account = accounts[0] || {};
-  $("#infoDisplayName").textContent = me?.display_name || me?.displayName || me?.username || "—";
-  $("#infoUsername").textContent = me?.username || "—";
-  $("#infoEmail").textContent = me?.email || "—";
-  $("#infoCustomerId").textContent = me?.id ? String(me.id).slice(0,8).toUpperCase() : "—";
-  $("#infoAccountNumber").textContent = account.account_number || "No account found";
-  $("#infoAccountType").textContent = account.account_type || account.type || "Everyday Demo Account";
+  if($("#infoDisplayName"))$("#infoDisplayName").textContent = me?.display_name || me?.displayName || me?.username || "—";
+  if($("#infoUsername"))$("#infoUsername").textContent = me?.username || "—";
+  if($("#infoEmail"))$("#infoEmail").textContent = me?.email || "—";
+  if($("#infoCustomerId"))$("#infoCustomerId").textContent = me?.id ? String(me.id).slice(0,8).toUpperCase() : "—";
+  if($("#infoAccountNumber"))$("#infoAccountNumber").textContent = account.account_number || "No account found";
+  if($("#infoAccountType"))$("#infoAccountType").textContent = account.account_type || account.type || "Everyday Demo Account";
   $("#infoAccountStatus").innerHTML = `<span class="status ${account.status==="active"?"status-active":""}">${esc(account.status || "Unknown")}</span>`;
-  $("#infoOpenedAt").textContent = displayDate(account.opened_at || account.created_at);
-  $("#infoBalance").textContent = "N₹ " + money(accounts.reduce((sum,a)=>sum+Number(a.balance||0),0));
+  if($("#infoOpenedAt"))$("#infoOpenedAt").textContent = displayDate(account.opened_at || account.created_at);
+  if($("#infoBalance"))$("#infoBalance").textContent = "N₹ " + money(accounts.reduce((sum,a)=>sum+Number(a.balance||0),0));
 }
 $("#copyAccountNumber")?.addEventListener("click",async()=>{
   const accountNumber = accounts[0]?.account_number;
@@ -84,9 +84,9 @@ $("#copyAccountNumber")?.addEventListener("click",async()=>{
   try{ await navigator.clipboard.writeText(accountNumber); notice("Account number copied."); }
   catch{ notice("Copy is unavailable in this browser. Account number: " + accountNumber, true); }
 });
-async function loadDashboard(){const d=await api("/me");me=d.user;setAuth(false);$("#userName").textContent=me.display_name||me.displayName||me.username;$("#roleBadge").textContent=me.role.toUpperCase();$("#adminPanel").classList.toggle("hidden",me.role!=="admin");
-const [a,t,l,c,p]=await Promise.all([api("/accounts"),api("/transactions"),api("/loans"),api("/cards"),api("/products")]);accounts=a.accounts||[];const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);$("#balance").textContent=money(total);$("#heroBalance").textContent=money(total);renderAccountInfo();$("#txCount").textContent=(t.transactions||[]).length;$("#loanCount").textContent=(l.applications||[]).length;$("#cardCount").textContent=(c.applications||[]).length;
-$("#accountNumber").textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";$("#fromAccount").innerHTML=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
+async function loadDashboard(){const d=await api("/me");me=d.user;setAuth(false);const userName=$("#userName"),roleBadge=$("#roleBadge"),adminPanel=$("#adminPanel");if(userName)userName.textContent=me.display_name||me.displayName||me.username;if(roleBadge)roleBadge.textContent=(me.role||"customer").toUpperCase();adminPanel?.classList.toggle("hidden",me.role!=="admin");
+const [a,t,l,c,p]=await Promise.all([api("/accounts"),api("/transactions"),api("/loans"),api("/cards"),api("/products")]);accounts=a.accounts||[];const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);const balanceEl=$("#balance"),heroBalance=$("#heroBalance"),txCount=$("#txCount"),loanCount=$("#loanCount"),cardCount=$("#cardCount");if(balanceEl)balanceEl.textContent=money(total);if(heroBalance)heroBalance.textContent=money(total);renderAccountInfo();if(txCount)txCount.textContent=(t.transactions||[]).length;if(loanCount)loanCount.textContent=(l.applications||[]).length;if(cardCount)cardCount.textContent=(c.applications||[]).length;
+const accountNumberEl=$("#accountNumber"),fromAccountEl=$("#fromAccount");if(accountNumberEl)accountNumberEl.textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";if(fromAccountEl)fromAccountEl.innerHTML=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
 const accountOptions=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";["#depositAccount","#withdrawAccount"].forEach(sel=>{if($(sel))$(sel).innerHTML=accountOptions});
 $("#transactions").innerHTML=(t.transactions||[]).slice(0,8).map(x=>`<div class="activity-item"><div><strong>${esc(x.description||x.type)}</strong><small>${esc(x.created_at||"")}</small></div><span class="amount ${String(x.type).includes("in")||x.type==="deposit"?"positive":"negative"}">${String(x.type).includes("in")||x.type==="deposit"?"+":"−"} N₹${money(x.amount)}</span></div>`).join("")||'<p class="empty">No transactions yet. This is a fresh demo account.</p>';
 window.__transactions=t.transactions||[];renderStatement(window.__transactions);
