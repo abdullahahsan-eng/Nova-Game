@@ -87,7 +87,7 @@ $("#copyAccountNumber")?.addEventListener("click",async()=>{
   catch{ notice("Copy is unavailable in this browser. Account number: " + accountNumber, true); }
 });
 async function loadDashboard(){const d=await api("/me");me=d.user;setAuth(false);const userName=$("#userName"),roleBadge=$("#roleBadge"),adminPanel=$("#adminPanel");if(userName)userName.textContent=me.display_name||me.displayName||me.username;if(roleBadge)roleBadge.textContent=(me.role||"customer").toUpperCase();adminPanel?.classList.toggle("hidden",me.role!=="admin");
-const results=await Promise.allSettled([api("/accounts"),api("/transactions"),api("/loans"),api("/cards"),api("/products")]);const fallback=(r,label)=>{if(r.status==="fulfilled")return r.value;console.error(label+" API failed",r.reason);return {};};const a=fallback(results[0],"accounts"),t=fallback(results[1],"transactions"),l=fallback(results[2],"loans"),c=fallback(results[3],"cards"),p=fallback(results[4],"products");accounts=a.accounts||[];const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);const balanceEl=$("#balance"),heroBalance=$("#heroBalance"),txCount=$("#txCount"),loanCount=$("#loanCount"),cardCount=$("#cardCount");if(balanceEl)balanceEl.textContent=money(total);if(heroBalance)heroBalance.textContent=money(total);renderAccountInfo();if(txCount)txCount.textContent=(t.transactions||[]).length;if(loanCount)loanCount.textContent=(l.applications||[]).length;if(cardCount)cardCount.textContent=(c.applications||[]).length;
+const results=await Promise.allSettled([api("/accounts"),api("/transactions"),api("/loans"),api("/cards"),api("/products")]);const fallback=(r,label)=>{if(r.status==="fulfilled")return r.value;console.error(label+" API failed",r.reason);return {};};const a=fallback(results[0],"accounts"),t=fallback(results[1],"transactions"),l=fallback(results[2],"loans"),c=fallback(results[3],"cards"),p=fallback(results[4],"products");accounts=a.accounts||[];renderCardBillAccountOptions();const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);const balanceEl=$("#balance"),heroBalance=$("#heroBalance"),txCount=$("#txCount"),loanCount=$("#loanCount"),cardCount=$("#cardCount");if(balanceEl)balanceEl.textContent=money(total);if(heroBalance)heroBalance.textContent=money(total);renderAccountInfo();if(txCount)txCount.textContent=(t.transactions||[]).length;if(loanCount)loanCount.textContent=(l.applications||[]).length;if(cardCount)cardCount.textContent=(c.applications||[]).length;
 const accountNumberEl=$("#accountNumber"),fromAccountEl=$("#fromAccount");if(accountNumberEl)accountNumberEl.textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";if(fromAccountEl)fromAccountEl.innerHTML=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
 const accountOptions=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
 availableCards=(p.cards||[]).filter(x=>x.status==="active");const creditSelect=$("#fromCreditCard");if(creditSelect)creditSelect.innerHTML=availableCards.map(x=>`<option value="${esc(x.id)}">Nova Rewards Card · •••• ${esc(String(x.demo_number||x.masked_number||"").slice(-4))} · Available N₹${money(Math.max(0,Number(x.credit_limit||0)-Number(x.outstanding||0)))}</option>`).join("")||"<option value=''>No active credit card</option>";updateTransferSource();["#depositAccount","#withdrawAccount"].forEach(sel=>{if($(sel))$(sel).innerHTML=accountOptions});
@@ -169,26 +169,66 @@ window.requestCardClosure=async(id,outstanding)=>{if(Number(outstanding)>0){noti
 window.reviewClosure=async(id,status)=>{try{const note=$("#closure-note-"+id)?.value||"";const r=await api(`/admin/closure-requests/${encodeURIComponent(id)}/review`,{method:"POST",body:JSON.stringify({status,note})});await loadDashboard();notice(r.message||`Closure ${status}.`)}catch(e){notice(e.message,true)}};
 
 
-// Credit-card bill payment: lookup by the last four card characters, then pay
-// only the fetched outstanding from the signed-in customer's active demo account.
+// Credit-card bill payment: any registered demo card can be paid by an authenticated customer.
+// Payment is debited only from an active account belonging to the signed-in payer.
+let cardBillLookupMatches=[];
+function renderCardBillAccountOptions(){
+  const select=$('#cardBillAccountId'); if(!select) return;
+  const active=accounts.filter(a=>a.status==='active');
+  const old=select.value;
+  select.innerHTML=active.map(a=>`<option value="${esc(a.id)}">${esc(a.account_type||a.type||'Account')} · ${esc(a.account_number)} · Available N₹${money(a.balance)}</option>`).join('')||'<option value="">No active account available</option>';
+  if(active.some(a=>a.id===old))select.value=old;
+  select.disabled=!active.length;
+}
+function renderCardBillMatch(){
+  const details=$('#cardBillDetails'); if(!details) return;
+  const selectedId=$('#cardBillCardId')?.value||'';
+  const c=cardBillLookupMatches.find(x=>x.cardId===selectedId)||cardBillLookupMatches[0];
+  if(!c){details.classList.add('hidden');return;}
+  const select=$('#cardBillCardId'); if(select&&select.value!==c.cardId)select.value=c.cardId;
+  const accountSelect=$('#cardBillAccountId');
+  const amount=Math.max(0,Number(c.outstanding||0));
+  details.innerHTML=`${cardBillLookupMatches.length>1?`<label>Matching registered cards<select id="cardBillCardId">${cardBillLookupMatches.map(x=>`<option value="${esc(x.cardId)}" ${x.cardId===c.cardId?'selected':''}>${esc(x.cardholderName)} · ${esc(x.maskedNumber)} · Outstanding N₹${money(x.outstanding)}</option>`).join('')}</select></label>`:''}
+    <div class="product-metrics"><div><small>Cardholder</small><b>${esc(c.cardholderName)}</b></div><div><small>Registered card</small><b>${esc(c.maskedNumber)}</b></div><div><small>Current outstanding</small><b>N₹ ${money(c.outstanding)}</b></div><div><small>Available credit</small><b>N₹ ${money(c.availableCredit)}</b></div></div>
+    <form id="cardBillPayForm" class="form-grid"><label>Pay from your account<select id="cardBillAccountId" name="accountId" required>${accounts.filter(a=>a.status==='active').map(a=>`<option value="${esc(a.id)}">${esc(a.account_type||a.type||'Account')} · ${esc(a.account_number)} · Available N₹${money(a.balance)}</option>`).join('')||'<option value="">No active account available</option>'}</select></label>
+    <label>Payment amount (N₹)<input id="cardBillAmount" name="amount" type="number" min="0.01" step="0.01" max="${(amount/100).toFixed(2)}" value="${(amount/100).toFixed(2)}" required></label>
+    <div class="form-actions"><button class="btn primary" type="submit" ${amount<=0||!accounts.some(a=>a.status==='active')?'disabled':''}>Confirm &amp; pay bill</button></div></form>
+    <p class="tiny muted">Payment is simulated. You may pay any matching registered card from one of your own active NovaBank accounts. Confirm the cardholder, card digits, source account and amount before payment.</p>`;
+  details.classList.remove('hidden');
+  $('#cardBillCardId')?.addEventListener('change',renderCardBillMatch);
+  $('#cardBillPayForm').addEventListener('submit',async ev=>{
+    ev.preventDefault(); const current=cardBillLookupMatches.find(x=>x.cardId===$('#cardBillCardId')?.value)||c;
+    const amountN=Number($('#cardBillAmount').value),amountCents=Math.round(amountN*100),accountId=$('#cardBillAccountId').value;
+    if(!accountId||!accounts.some(a=>a.id===accountId&&a.status==='active')){notice('Select one of your own active accounts.',true);return;}
+    if(!Number.isFinite(amountN)||amountCents<100||amountCents>Number(current.outstanding)){notice('Enter an amount between N₹1 and the latest outstanding.',true);return;}
+    const source=accounts.find(a=>a.id===accountId);
+    if(!confirm(`Pay N₹${(amountCents/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})} toward ${current.cardholderName}'s card ${current.maskedNumber} from your account ${source.account_number}?`))return;
+    const btn=ev.currentTarget.querySelector('button[type="submit"]');btn.disabled=true;
+    const idempotencyKey=crypto.randomUUID();
+    try{
+      const result=await api('/card-bill/pay',{method:'POST',body:JSON.stringify({cardId:current.cardId,accountId,amount:amountN,idempotencyKey})});
+      $('#cardBillStatus').textContent=result.message;$('#cardBillStatus').className='valid';details.classList.add('hidden');$('#cardBillLookupForm').reset();cardBillLookupMatches=[];
+      await loadDashboard();notice(result.message||'Demo card bill payment recorded.');
+    }catch(err){notice(err.message,true);btn.disabled=false;}
+  });
+  renderCardBillAccountOptions();
+}
 function ensureCardBillPanel(){
-  if($('#cardBillPanel')) return;
+  if($('#cardBillPanel')){renderCardBillAccountOptions();return;}
   const anchor=$('#transferPanel'); if(!anchor) return;
   const panel=document.createElement('section'); panel.id='cardBillPanel'; panel.className='panel';
-  panel.innerHTML=`<div class="panel-heading"><div><p class="eyebrow">CARD PAYMENTS</p><h3>Pay Credit Card Bill</h3><p class="muted">Enter the last four characters of your registered NovaBank demo card to fetch its current outstanding.</p></div></div>
-    <form id="cardBillLookupForm" class="form-grid"><label>Card last 4 characters<input id="cardBillLast4" name="last4" minlength="4" maxlength="4" pattern="[A-Za-z0-9]{4}" autocomplete="off" required placeholder="e.g. 4821"></label><div class="form-actions"><button class="btn secondary" type="submit">Fetch outstanding</button></div></form>
+  panel.innerHTML=`<div class="panel-heading"><div><p class="eyebrow">CARD PAYMENTS</p><h3>Pay Credit Card Bill</h3><p class="muted">Enter the last four digits to fetch matching registered cards. Any authenticated customer can pay from their own active account.</p></div></div>
+    <form id="cardBillLookupForm" class="form-grid"><label>Card last 4 digits<input id="cardBillLast4" name="last4" minlength="4" maxlength="4" pattern="[A-Za-z0-9]{4}" autocomplete="off" required placeholder="e.g. 4821"></label><div class="form-actions"><button class="btn secondary" type="submit">Fetch bill</button></div></form>
     <div id="cardBillDetails" class="hidden" aria-live="polite"></div><p id="cardBillStatus" class="muted" aria-live="polite"></p>`;
   anchor.insertAdjacentElement('afterend',panel);
   $('#cardBillLookupForm').addEventListener('submit',async e=>{
-    e.preventDefault(); const status=$('#cardBillStatus'),details=$('#cardBillDetails'),last4=$('#cardBillLast4').value.trim().toUpperCase();
-    details.classList.add('hidden'); status.textContent='Fetching current outstanding…';
-    try{
-      const d=await api(`/card-bill?last4=${encodeURIComponent(last4)}`);
-      details.innerHTML=`<div class="product-metrics"><div><small>Card</small><b>${esc(d.cardName)} · •••• ${esc(last4)}</b></div><div><small>Current outstanding</small><b>N₹ ${money(d.outstanding)}</b></div><div><small>Available credit</small><b>N₹ ${money(d.availableCredit)}</b></div></div><form id="cardBillPayForm" class="form-grid"><label>Payment amount (N₹)<input id="cardBillAmount" name="amount" type="number" min="1" step="0.01" max="${(Number(d.outstanding)/100).toFixed(2)}" value="${(Number(d.outstanding)/100).toFixed(2)}" required></label><div class="form-actions"><button class="btn primary" type="submit" ${Number(d.outstanding)<=0?'disabled':''}>Pay bill from demo account</button></div></form><p class="tiny muted">Payment is simulated. It will deduct from your active NovaBank demo account and reduce this card's outstanding.</p>`;
-      details.classList.remove('hidden'); status.textContent=Number(d.outstanding)>0?'Outstanding fetched. Review the amount before paying.':'This card has no outstanding dues.';
-      $('#cardBillPayForm').addEventListener('submit',async ev=>{ev.preventDefault();const amount=Number($('#cardBillAmount').value);if(!Number.isFinite(amount)||amount<=0||amount*100>Number(d.outstanding)){notice('Enter an amount up to the current outstanding.',true);return;}if(!confirm(`Pay N₹${amount.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})} toward card •••• ${last4} from your demo account?`))return;const btn=ev.currentTarget.querySelector('button[type="submit"]');btn.disabled=true;try{const result=await api('/card-bill/pay',{method:'POST',body:JSON.stringify({cardId:d.cardId,amount})});status.textContent=result.message;details.classList.add('hidden');$('#cardBillLookupForm').reset();await loadDashboard();notice(result.message||'Demo card bill payment recorded.');}catch(err){notice(err.message,true);btn.disabled=false;}});
-    }catch(err){status.textContent=err.message;status.className='invalid';}
+    e.preventDefault();const status=$('#cardBillStatus'),details=$('#cardBillDetails'),last4=$('#cardBillLast4').value.trim().toUpperCase();
+    details.classList.add('hidden');status.className='muted';status.textContent='Fetching matching cards…';cardBillLookupMatches=[];
+    try{const d=await api(`/card-bill?last4=${encodeURIComponent(last4)}`);cardBillLookupMatches=d.matches||[];if(!cardBillLookupMatches.length)throw new Error('No matching registered cards found.');
+      status.textContent=cardBillLookupMatches.length>1?`${cardBillLookupMatches.length} cards share these last four digits. Select the correct cardholder and masked card before paying.`:'Bill fetched. Confirm the cardholder, source account and amount.';renderCardBillMatch();
+    }catch(err){status.textContent=err.message;status.className='invalid';details.classList.add('hidden');}
   });
+  renderCardBillAccountOptions();
 }
 
 // Dedicated customer views; keep existing data and API routes intact.
