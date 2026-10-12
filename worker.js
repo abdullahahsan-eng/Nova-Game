@@ -95,6 +95,14 @@ async function ensureColumn(env, table, column, definition) {
     }
   }
 }
+async function ensureCardTransactions(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS card_transactions (
+    id TEXT PRIMARY KEY, card_id TEXT NOT NULL, user_id TEXT NOT NULL, transaction_group TEXT NOT NULL,
+    type TEXT NOT NULL, amount INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_card_transactions_card_date ON card_transactions(card_id,created_at DESC)").run();
+}
 async function ensureCardColumns(env) {
   await ensureColumn(env, "card_applications", "existing_emi", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
@@ -596,6 +604,8 @@ async function route(request, env) {
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(ledgerId,account.id,group,"card_bill_payment",amount,nextBalance,"Demo credit card bill payment")
     ]);
     if(batch.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Payment could not be completed safely. Refresh and try again."},409,request);
+    await ensureCardTransactions(env);
+    await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,group,"bill_payment",amount,"Demo credit card bill payment").run();
     await postTreasury(env,user,"card_bill_payment",amount,`Demo credit card bill payment · ${card.id}`,"virtual_card",card.id,group);
     await audit(env,user,"demo_card_bill_payment","virtual_card",card.id,{amount,transactionGroup:group});
     return response({ok:true,message:`Demo card bill payment successful. Remaining outstanding N₹${(nextOutstanding/100).toFixed(2)}.`,transactionId:group},200,request);
@@ -652,6 +662,11 @@ async function route(request, env) {
         env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(creditId,dest.id,group,"transfer_in",amount,nextDest,"Demo credit-card-funded transfer" )
       ]);
       if(results.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Transfer could not be completed safely. Refresh and retry."},409,request);
+      await ensureCardTransactions(env);
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,group,"funded_transfer",amount,`Credit-card-funded transfer to ${dest.account_number}`),
+        env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,group,"transfer_fee",fee,"0.9% demo transfer fee")
+      ]);
       await postTreasury(env,user,"credit_card_funded_transfer",0,`Credit-card-funded transfer principal N₹${(amount/100).toFixed(2)}`,"transaction",group,group);
       await postTreasury(env,user,"credit_card_transfer_fee",fee,"0.9% demo credit-card transfer fee","transaction",group,group);
       await audit(env,user,"demo_credit_card_transfer","transaction",group,{amount,fee,total,cardId:card.id,toAccount:dest.id});
@@ -729,7 +744,11 @@ async function route(request, env) {
     const cards = user.role === "admin"
       ? await env.DB.prepare("SELECT * FROM virtual_cards ORDER BY created_at DESC LIMIT 500").all()
       : await env.DB.prepare("SELECT * FROM virtual_cards WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
-    return response({ loans: loans.results || [], cards: cards.results || [] }, 200, request);
+    await ensureCardTransactions(env);
+    const cardTransactions = user.role === "admin"
+      ? await env.DB.prepare("SELECT * FROM card_transactions ORDER BY created_at DESC LIMIT 300").all()
+      : await env.DB.prepare("SELECT * FROM card_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
+    return response({ loans: loans.results || [], cards: cards.results || [], cardTransactions: cardTransactions.results || [] }, 200, request);
   }
 
   const acceptLoanMatch = path.match(/^\/api\/loans\/([^/]+)\/accept$/);
@@ -749,21 +768,22 @@ async function route(request, env) {
     if (exists) return response({ error: "This demo loan has already been activated." }, 409, request);
     const account = await env.DB.prepare("SELECT * FROM accounts WHERE user_id=? AND status='active' ORDER BY opened_at LIMIT 1").bind(user.id).first();
     if (!account) return response({ error: "No active demo account is available." }, 400, request);
-    const id=uid(), amount=Number(loan.sanctioned_amount), tenure=Number(loan.tenure_months), monthly=Math.ceil(amount/tenure), group=uid();
+    const id=uid(), amount=Number(loan.sanctioned_amount), tenure=Number(loan.tenure_months), feeRate=amount<=1000000?0.01:0.02, processingFee=Math.round(amount*feeRate), totalOutstanding=amount+processingFee, monthly=Math.ceil(totalOutstanding/tenure), group=uid();
     await ensureTreasury(env);
     const treasuryFunds = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger").first();
     const availableTreasury = Number(treasuryFunds?.balance || 0);
     if (availableTreasury < amount) return response({error:`Insufficient Treasury Funds. Available N₹${(availableTreasury/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}; required N₹${(amount/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}. Add funds before disbursement.`},409,request);
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO demo_loans(id,application_id,user_id,account_id,principal_amount,outstanding_amount,tenure_months,remaining_months,monthly_payment,status) VALUES(?,?,?,?,?,?,?,?,?,'active')").bind(id,loan.id,user.id,account.id,amount,amount,tenure,tenure,monthly),
+      env.DB.prepare("INSERT INTO demo_loans(id,application_id,user_id,account_id,principal_amount,outstanding_amount,tenure_months,remaining_months,monthly_payment,status) VALUES(?,?,?,?,?,?,?,?,?,'active')").bind(id,loan.id,user.id,account.id,amount,totalOutstanding,tenure,tenure,monthly),
       env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=?").bind(amount,account.id,user.id),
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"loan_disbursement",amount,Number(account.balance)+amount,"Demo loan disbursement"),
       env.DB.prepare("UPDATE loan_applications SET status='disbursed',updated_at=datetime('now') WHERE id=? AND user_id=? AND status='approved'").bind(loan.id,user.id)
     ]);
     await postTreasury(env,user,"loan_disbursement",-amount,`Demo loan disbursement · ${id}`,"demo_loan",id,group);
-    await notify(env,user.id,"Demo loan activated",`N₹${(amount/100).toFixed(2)} demo loan added to your demo account. Monthly demo EMI: N₹${(monthly/100).toFixed(2)}.`);
-    await audit(env,user,"demo_loan_disbursed","demo_loan",id,{applicationId:loan.id,amount,tenure});
-    return response({ok:true,message:"Demo loan accepted and disbursed to your fictional account."},200,request);
+    await postTreasury(env,user,"loan_processing_fee",processingFee,`${feeRate*100}% demo loan processing fee · ${id}`,"demo_loan",id,group);
+    await notify(env,user.id,"Demo loan activated",`N₹${(amount/100).toFixed(2)} demo loan credited. Processing fee: N₹${(processingFee/100).toFixed(2)} (${feeRate*100}%). Total starting outstanding: N₹${(totalOutstanding/100).toFixed(2)}.`);
+    await audit(env,user,"demo_loan_disbursed","demo_loan",id,{applicationId:loan.id,amount,tenure,processingFee,feeRate});
+    return response({ok:true,message:`Demo loan disbursed. Processing fee ${feeRate*100}%: N₹${(processingFee/100).toFixed(2)}. Starting outstanding: N₹${(totalOutstanding/100).toFixed(2)}.`},200,request);
   }
 
   const repayLoanMatch = path.match(/^\/api\/loans\/([^/]+)\/repay$/);
@@ -843,11 +863,14 @@ async function route(request, env) {
           await postTreasury(env,user,"foreclosure_reversal",-amount,`Rejected foreclosure reversed · ${loan.id}`,"product_closure_request",r.id,group);
         }
       } else {
-        const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
-        if(!card) return response({error:"Card is no longer awaiting closure."},409,request);
+        const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(r.product_id,r.user_id).first();
+        if(!card) return response({error:"Card record not found. Refresh the queue and inspect the customer history."},404,request);
         if(status==='approved') {
-          const changed=await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
-          if(!Number(changed.meta?.changes||0)) return response({error:"Card closure could not be approved: confirm the card is still pending and its outstanding is zero."},409,request);
+          if(card.status==='closed' && Number(card.outstanding)===0) { /* Idempotent approval: product was already closed. */ }
+          else {
+            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
+            if(!Number(changed.meta?.changes||0)) return response({error:`Card closure cannot be approved: current status is ${card.status} and outstanding is N₹${(Number(card.outstanding||0)/100).toFixed(2)}. Refresh and inspect the card before retrying.`},409,request);
+          }
         } else {
           const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
           if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed before rejection. Refresh and review again."},409,request);
@@ -969,9 +992,16 @@ async function route(request, env) {
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardActivateMatch[1],user.id).first();
     if (!card) return response({error:"Virtual card not found."},404,request);
     if (card.status === "blocked") return response({error:"Blocked card must be unblocked by an admin."},400,request);
-    await env.DB.prepare("UPDATE virtual_cards SET status='active' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
-    await audit(env,user,"demo_card_activated","virtual_card",card.id);
-    return response({ok:true,message:"Demo card activated."},200,request);
+    const joiningFee=50000;
+    if(Number(card.credit_limit)<joiningFee) return response({error:"Approved card limit must be at least N₹500 to cover the demo joining fee."},400,request);
+    await ensureCardTransactions(env);
+    const feeGroup=uid();
+    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',outstanding=outstanding+? WHERE id=? AND user_id=? AND status='inactive' AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
+    if(!Number(activated.meta?.changes||0)) return response({error:"Card could not be activated safely. Refresh and check its status/available limit."},409,request);
+    await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,feeGroup,"joining_fee",joiningFee,"Nova Rewards Card joining fee (N₹500)").run();
+    await postTreasury(env,user,"card_joining_fee",joiningFee,"N₹500 demo card joining fee","virtual_card",card.id,feeGroup);
+    await audit(env,user,"demo_card_activated","virtual_card",card.id,{joiningFee});
+    return response({ok:true,message:"Demo card activated. N₹500 joining fee added to card outstanding.",joiningFee:500},200,request);
   }
   const cardBlockMatch = path.match(/^\/api\/cards\/([^/]+)\/block$/);
   if (method === "POST" && cardBlockMatch) {
@@ -990,7 +1020,9 @@ async function route(request, env) {
     if(Number(card.credit_limit)-Number(card.outstanding)<amount) return response({error:"Insufficient available demo credit."},400,request);
     const result=await env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding+? WHERE id=? AND user_id=? AND status='active' AND credit_limit-outstanding>=?").bind(amount,card.id,user.id,amount).run();
     if(!result.success || result.meta?.changes===0) return response({error:"Purchase could not be completed; refresh and try again."},409,request);
-    await postTreasury(env,user,"card_purchase",0,`Demo card purchase N₹${(amount/100).toFixed(2)} at ${merchant}`,"virtual_card",card.id,uid());
+    await ensureCardTransactions(env); const txGroup=uid();
+    await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,txGroup,"purchase",amount,`Demo purchase at ${merchant}`).run();
+    await postTreasury(env,user,"card_purchase",0,`Demo card purchase N₹${(amount/100).toFixed(2)} at ${merchant}`,"virtual_card",card.id,txGroup);
     await audit(env,user,"demo_card_purchase","virtual_card",card.id,{amount,merchant});
     await notify(env,user.id,"Demo card purchase",`N₹${(amount/100).toFixed(2)} demo purchase at ${merchant}.`);
     return response({ok:true,message:"Demo purchase recorded.",outstanding:Number(card.outstanding)+amount,availableCredit:Number(card.credit_limit)-Number(card.outstanding)-amount},200,request);
@@ -1010,6 +1042,8 @@ async function route(request, env) {
       env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding-? WHERE id=? AND outstanding>=?").bind(amount,card.id,amount),
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"card_repayment",amount,Number(account.balance)-amount,"Demo credit card repayment")
     ]);
+    await ensureCardTransactions(env);
+    await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,group,"repayment",amount,"Demo credit card repayment").run();
     await postTreasury(env,user,"card_repayment",amount,`Demo credit card repayment · ${card.id}`,"virtual_card",card.id,group);
     await audit(env,user,"demo_card_repayment","virtual_card",card.id,{amount});
     return response({ok:true,message:"Demo card repayment recorded."},200,request);

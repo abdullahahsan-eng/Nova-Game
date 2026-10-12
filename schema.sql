@@ -127,3 +127,11 @@ CREATE TABLE IF NOT EXISTS card_control_requests (
   note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
   reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
 );
+
+
+CREATE TABLE IF NOT EXISTS card_transactions (
+  id TEXT PRIMARY KEY, card_id TEXT NOT NULL, user_id TEXT NOT NULL, transaction_group TEXT NOT NULL,
+  type TEXT NOT NULL, amount INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_card_transactions_card_date ON card_transactions(card_id,created_at DESC);
