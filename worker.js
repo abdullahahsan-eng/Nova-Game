@@ -872,8 +872,14 @@ async function route(request, env) {
             if(!Number(changed.meta?.changes||0)) return response({error:`Card closure cannot be approved: current status is ${card.status} and outstanding is N₹${(Number(card.outstanding||0)/100).toFixed(2)}. Refresh and inspect the card before retrying.`},409,request);
           }
         } else {
-          const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
-          if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed before rejection. Refresh and review again."},409,request);
+          // Rejection should remain reviewable if a concurrent/admin action already
+          // returned the card to inactive. Never overwrite a newly closed/blocked card.
+          if(card.status==='closure_pending') {
+            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
+            if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed during review. Refresh and review again."},409,request);
+          } else if(card.status!=='inactive') {
+            return response({error:`Card closure cannot be rejected because its current status is ${card.status}. Refresh and inspect the card.`},409,request);
+          }
         }
       }
       await env.DB.prepare("UPDATE product_closure_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(status,note,user.id,r.id).run();
