@@ -106,6 +106,53 @@ async function route(request, env) {
     return response({ ok: true }, 200, request);
   }
   if (!user) return response({ error: "Please log in." }, 401, request);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS product_closure_requests (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), product_type TEXT NOT NULL CHECK(product_type IN ('loan','card')),
+    product_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+    amount_paid INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
+  )`).run();
+  if (method === "GET" && path === "/api/closure-requests") {
+    const rows = user.role === "admin"
+      ? await env.DB.prepare(`SELECT r.*,u.display_name,u.username FROM product_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all()
+      : await env.DB.prepare("SELECT * FROM product_closure_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
+    return response({requests:rows.results||[]},200,request);
+  }
+  const loanClosure = path.match(/^\/api\/loans\/([^/]+)\/closure-request$/);
+  if (method === "POST" && loanClosure) {
+    const loan = await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='active'").bind(loanClosure[1],user.id).first();
+    if (!loan) return response({error:"Active demo loan not found."},404,request);
+    const duplicate = await env.DB.prepare("SELECT id FROM product_closure_requests WHERE product_type='loan' AND product_id=? AND status='pending'").bind(loan.id).first();
+    if (duplicate) return response({error:"A loan closure request is already awaiting admin review."},409,request);
+    const amount=Number(loan.outstanding_amount);
+    if (!Number.isSafeInteger(amount)||amount<=0) return response({error:"This loan has no outstanding balance. Refresh your dashboard."},400,request);
+    const account=await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(loan.account_id,user.id).first();
+    if(!account || Number(account.balance)<amount) return response({error:`Full foreclosure requires N₹${(amount/100).toFixed(2)} available in your demo account. Please clear the full outstanding first.`},400,request);
+    const reqId=uid(),group=uid(),ledgerId=uid(),after=Number(account.balance)-amount;
+    const results=await env.DB.batch([
+      env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND status='active' AND balance>=?").bind(amount,account.id,user.id,amount),
+      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM accounts WHERE id=? AND balance=?)").bind(ledgerId,account.id,group,"loan_foreclosure_pending",amount,after,`Full demo loan foreclosure payment · ${loan.id}`,account.id,after),
+      env.DB.prepare("UPDATE demo_loans SET status='closure_pending',updated_at=datetime('now') WHERE id=? AND user_id=? AND status='active' AND outstanding_amount=? AND EXISTS(SELECT 1 FROM ledger WHERE id=? AND transaction_group=?)").bind(loan.id,user.id,amount,ledgerId,group),
+      env.DB.prepare("INSERT INTO product_closure_requests(id,user_id,product_type,product_id,status,amount_paid,note) VALUES(?,?, 'loan',?,'pending',?,?)").bind(reqId,user.id,loan.id,amount,"Full outstanding paid; awaiting admin closure approval")
+    ]);
+    if(!Number(results?.[0]?.meta?.changes||0)||!Number(results?.[1]?.meta?.changes||0)||!Number(results?.[2]?.meta?.changes||0)) return response({error:"Full payment could not be recorded safely. Refresh and retry."},409,request);
+    await notify(env,user.id,"Loan closure awaiting review",`Full demo outstanding of N₹${(amount/100).toFixed(2)} has been paid. Admin confirmation is pending.`);
+    await audit(env,user,"loan_closure_requested","demo_loan",loan.id,{requestId:reqId,amount});
+    return response({ok:true,requestId:reqId,message:`Full payment recorded (N₹${(amount/100).toFixed(2)}). Loan will close after admin approval.`},201,request);
+  }
+  const cardClosure = path.match(/^\/api\/cards\/([^/]+)\/closure-request$/);
+  if (method === "POST" && cardClosure) {
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status IN ('active','inactive','blocked')").bind(cardClosure[1],user.id).first();
+    if(!card) return response({error:"Demo card not found or already closed."},404,request);
+    if(Number(card.outstanding)>0) return response({error:`Please clear card dues of N₹${(Number(card.outstanding)/100).toFixed(2)} before requesting closure.`},400,request);
+    const duplicate=await env.DB.prepare("SELECT id FROM product_closure_requests WHERE product_type='card' AND product_id=? AND status='pending'").bind(card.id).first();
+    if(duplicate) return response({error:"A card closure request is already awaiting admin review."},409,request);
+    const reqId=uid(); await env.DB.prepare("INSERT INTO product_closure_requests(id,user_id,product_type,product_id,status,note) VALUES(?,?, 'card',?,'pending','Outstanding is zero; awaiting admin closure approval')").bind(reqId,user.id,card.id).run();
+    await env.DB.prepare("UPDATE virtual_cards SET status='closure_pending' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
+    await notify(env,user.id,"Card closure request submitted","Your demo card closure request is awaiting admin review.");
+    await audit(env,user,"card_closure_requested","virtual_card",card.id,{requestId:reqId});
+    return response({ok:true,requestId:reqId,message:"Card closure request submitted. It will disappear from Cards & Loans after admin approval."},201,request);
+  }
   if (method === "GET" && path === "/api/me") return response({ user }, 200, request);
 
   // Super Admin: list customers and their demo accounts.
@@ -532,6 +579,41 @@ async function route(request, env) {
     if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
     const d = await body(request);
 
+    const closureReview = path.match(/^\/api\/admin\/closure-requests\/([^/]+)\/review$/);
+    if (closureReview) {
+      const status=String(d.status||""), note=String(d.note||"").trim().slice(0,250);
+      if(!["approved","rejected"].includes(status)) return response({error:"Choose approve or reject."},400,request);
+      const r=await env.DB.prepare("SELECT * FROM product_closure_requests WHERE id=? AND status='pending'").bind(closureReview[1]).first();
+      if(!r) return response({error:"Pending closure request not found."},404,request);
+      if(r.product_type==='loan') {
+        const loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
+        if(!loan) return response({error:"Loan is no longer awaiting closure."},409,request);
+        if(status==='approved') {
+          await env.DB.batch([
+            env.DB.prepare("UPDATE demo_loans SET outstanding_amount=0,remaining_months=0,status='closed',updated_at=datetime('now') WHERE id=? AND status='closure_pending'").bind(loan.id),
+            env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=?").bind(loan.application_id,r.user_id)
+          ]);
+        } else {
+          const acct=await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=?").bind(loan.account_id,r.user_id).first();
+          if(!acct) return response({error:"Linked demo account not found; cannot safely reverse payment."},409,request);
+          const group=uid(),amount=Number(r.amount_paid),after=Number(acct.balance)+amount;
+          await env.DB.batch([
+            env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=?").bind(amount,acct.id,r.user_id),
+            env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),acct.id,group,"loan_foreclosure_reversal",amount,after,"Reversal of rejected demo loan closure request"),
+            env.DB.prepare("UPDATE demo_loans SET status='active',updated_at=datetime('now') WHERE id=? AND status='closure_pending'").bind(loan.id)
+          ]);
+        }
+      } else {
+        const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
+        if(!card) return response({error:"Card is no longer awaiting closure."},409,request);
+        if(status==='approved') await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND outstanding=0").bind(card.id,r.user_id).run();
+        else await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
+      }
+      await env.DB.prepare("UPDATE product_closure_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(status,note,user.id,r.id).run();
+      await notify(env,r.user_id,`${r.product_type==='loan'?'Loan':'Card'} closure ${status}`,status==='approved'?"Your demo product has been closed and removed from active products.":`Your closure request was rejected. ${note}`);
+      await audit(env,user,`${r.product_type}_closure_${status}`,r.product_type,r.product_id,{requestId:r.id,note});
+      return response({ok:true,message:`Closure request ${status}.`},200,request);
+    }
     const assignOfferMatch = path.match(/^\/api\/admin\/offers\/([^/]+)\/assign$/);
     if (assignOfferMatch) {
       const targetUser = String(d.userId || "").trim();
