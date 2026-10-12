@@ -42,6 +42,21 @@ async function audit(env, actor, action, targetType, targetId, details = {}) {
 async function notify(env, userId, title, message) {
   await env.DB.prepare("INSERT INTO notifications(id,user_id,title,message) VALUES(?,?,?,?)").bind(uid(), userId, title, message).run();
 }
+async function ensureColumn(env, table, column, definition) {
+  const cols = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+  if (!(cols.results || []).some(c => c.name === column)) {
+    try { await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run(); } catch (e) {
+      // Concurrent first requests may race; confirm the column exists before failing.
+      const again = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
+      if (!(again.results || []).some(c => c.name === column)) throw e;
+    }
+  }
+}
+async function ensureCardColumns(env) {
+  await ensureColumn(env, "card_applications", "existing_emi", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
+  await ensureColumn(env, "virtual_cards", "demo_number", "TEXT NOT NULL DEFAULT ''");
+}
 async function route(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -419,14 +434,21 @@ async function route(request, env) {
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "POST" && path === "/api/cards") {
-    const d = await body(request), limit = Math.round(Number(d.requestedLimit)*100);
-    if (!Number.isSafeInteger(limit) || limit < 10000 || limit > 100000000) return response({ error:"Enter a valid demo limit." },400,request);
-    const income=Math.max(0,Math.round(Number(d.monthlyIncome||0)*100)), expenses=Math.max(0,Math.round(Number(d.monthlyExpenses||0)*100)), debt=Math.max(0,Math.round(Number(d.existingDebt||0)*100));
-    const suggested=Math.max(0,Math.min(limit,Math.round(Math.max(0,income-expenses-debt)*3)));
+    await ensureCardColumns(env);
+    const d = await body(request);
+    const income=Math.round(Number(d.monthlyIncome||0)*100), expenses=Math.round(Number(d.monthlyExpenses||0)*100);
+    const emi=Math.round(Number(d.existingEmi||0)*100), debt=Math.round(Number(d.existingDebt||0)*100), loanOutstanding=Math.round(Number(d.loanOutstanding||0)*100);
+    if (![income,expenses,emi,debt,loanOutstanding].every(n=>Number.isSafeInteger(n)&&n>=0) || income>10000000000 || expenses>10000000000 || emi>10000000000 || debt>100000000000 || loanOutstanding>100000000000 || expenses>income*10)
+      return response({error:"Enter valid non-negative financial details."},400,request);
+    const monthlySurplus=Math.max(0,income-expenses-emi);
+    // Fictional, configurable-style heuristic: 3x monthly surplus, capped at N₹200,000.
+    // Existing outstanding informs the risk adjustment; this is not a real credit decision.
+    const suggested=Math.max(0,Math.min(20000000,Math.round(monthlySurplus*3*Math.max(0.25,1-Math.min(0.75,(debt+loanOutstanding)/Math.max(income*12,1))))));
     const id=uid();
-    await env.DB.prepare("INSERT INTO card_applications(id,user_id,requested_limit,monthly_income,monthly_expenses,existing_debt,suggested_limit) VALUES(?,?,?,?,?,?,?)").bind(id,user.id,limit,income,expenses,debt,suggested).run();
-    await audit(env,user,"card_application_submitted","card_application",id);
-    return response({ok:true,id,suggestedLimit:suggested/100,message:"Demo card application submitted for review."},201,request);
+    await env.DB.prepare("INSERT INTO card_applications(id,user_id,requested_limit,monthly_income,monthly_expenses,existing_debt,suggested_limit,existing_emi,loan_outstanding) VALUES(?,?,?,?,?,?,?,?,?)")
+      .bind(id,user.id,0,income,expenses,debt,suggested,emi,loanOutstanding).run();
+    await audit(env,user,"card_application_submitted","card_application",id,{income,expenses,existingEmi:emi,existingCardDebt:debt,loanOutstanding,suggestedLimit:suggested});
+    return response({ok:true,id,suggestedLimit:suggested/100,message:"Demo card application submitted for bank assessment."},201,request);
   }
   if (method === "GET" && path === "/api/cards") {
     const rows = user.role === "admin" ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
@@ -563,23 +585,75 @@ async function route(request, env) {
     }
     const cardMatch = path.match(/^\/api\/admin\/cards\/([^/]+)\/review$/);
     if (cardMatch) {
+      await ensureCardColumns(env);
       const status=String(d.status||""), allowed=["need_documents","verified","approved","rejected"];
       if(!allowed.includes(status)) return response({error:"Invalid review status."},400,request);
       const amount=d.sanctionedLimit==null?null:Math.round(Number(d.sanctionedLimit)*100);
       const card=await env.DB.prepare("SELECT * FROM card_applications WHERE id=?").bind(cardMatch[1]).first();
       if(!card) return response({error:"Application not found."},404,request);
-      if(status==="approved"&&(!Number.isSafeInteger(amount)||amount<100||amount>card.requested_limit)) return response({error:"Approved limit must be positive and not exceed requested limit."},400,request);
+      if(status==="approved"&&(!Number.isSafeInteger(amount)||amount<100||amount>20000000)) return response({error:"Approved limit must be between N₹1 and N₹200,000."},400,request);
       await env.DB.prepare("UPDATE card_applications SET status=?,sanctioned_limit=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status,amount,String(d.note||""),card.id).run();
       if(status==="approved") {
         const finalLimit = Number(amount);
         const suffix = String(card.id).replace(/[^a-z0-9]/gi,"").slice(-4).toUpperCase().padStart(4,"0");
-        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status) VALUES(?,?,?,?,0,'active') ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit,status='active'").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit).run();
+        const demoHash = await digest(card.id); const demoNumber = "9000" + demoHash.slice(0,12).replace(/[^0-9]/g,"7").padEnd(12,"7") + suffix;
+        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number) VALUES(?,?,?,?,0,'inactive',?) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='inactive', demo_number=excluded.demo_number").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
       }
       await notify(env,card.user_id,"Virtual card application update",`Your demo card application status is now: ${status}. ${String(d.note||"")}`);
       await audit(env,user,"card_review","card_application",card.id,{status,amount,note:d.note||""});
       return response({ok:true},200,request);
     }
   }
+  const cardActivateMatch = path.match(/^\/api\/cards\/([^/]+)\/activate$/);
+  if (method === "POST" && cardActivateMatch) {
+    await ensureCardColumns(env);
+    const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardActivateMatch[1],user.id).first();
+    if (!card) return response({error:"Virtual card not found."},404,request);
+    if (card.status === "blocked") return response({error:"Blocked card must be unblocked by an admin."},400,request);
+    await env.DB.prepare("UPDATE virtual_cards SET status='active' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
+    await audit(env,user,"demo_card_activated","virtual_card",card.id);
+    return response({ok:true,message:"Demo card activated."},200,request);
+  }
+  const cardBlockMatch = path.match(/^\/api\/cards\/([^/]+)\/block$/);
+  if (method === "POST" && cardBlockMatch) {
+    const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardBlockMatch[1],user.id).first();
+    if (!card) return response({error:"Virtual card not found."},404,request);
+    await env.DB.prepare("UPDATE virtual_cards SET status='blocked' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
+    await audit(env,user,"demo_card_blocked","virtual_card",card.id);
+    return response({ok:true,message:"Demo card blocked."},200,request);
+  }
+  const cardPurchaseMatch = path.match(/^\/api\/cards\/([^/]+)\/purchase$/);
+  if (method === "POST" && cardPurchaseMatch) {
+    const d=await body(request), amount=Math.round(Number(d.amount)*100), merchant=String(d.merchant||"Demo Store").trim().slice(0,80);
+    if(!Number.isSafeInteger(amount)||amount<100||amount>20000000) return response({error:"Enter a purchase amount between N₹1 and N₹200,000."},400,request);
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active'").bind(cardPurchaseMatch[1],user.id).first();
+    if(!card) return response({error:"Card is not active."},400,request);
+    if(Number(card.credit_limit)-Number(card.outstanding)<amount) return response({error:"Insufficient available demo credit."},400,request);
+    const result=await env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding+? WHERE id=? AND user_id=? AND status='active' AND credit_limit-outstanding>=?").bind(amount,card.id,user.id,amount).run();
+    if(!result.success || result.meta?.changes===0) return response({error:"Purchase could not be completed; refresh and try again."},409,request);
+    await audit(env,user,"demo_card_purchase","virtual_card",card.id,{amount,merchant});
+    await notify(env,user.id,"Demo card purchase",`N₹${(amount/100).toFixed(2)} demo purchase at ${merchant}.`);
+    return response({ok:true,message:"Demo purchase recorded.",outstanding:Number(card.outstanding)+amount,availableCredit:Number(card.credit_limit)-Number(card.outstanding)-amount},200,request);
+  }
+  const cardRepayMatch = path.match(/^\/api\/cards\/([^/]+)\/repay$/);
+  if (method === "POST" && cardRepayMatch) {
+    const d=await body(request), amount=Math.round(Number(d.amount)*100);
+    if(!Number.isSafeInteger(amount)||amount<100) return response({error:"Enter a repayment amount of at least N₹1."},400,request);
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardRepayMatch[1],user.id).first();
+    if(!card||Number(card.outstanding)<=0) return response({error:"No card outstanding found."},404,request);
+    if(amount>Number(card.outstanding)) return response({error:"Repayment cannot exceed card outstanding."},400,request);
+    const account=await env.DB.prepare("SELECT * FROM accounts WHERE user_id=? AND status='active' ORDER BY opened_at LIMIT 1").bind(user.id).first();
+    if(!account||Number(account.balance)<amount) return response({error:"Insufficient demo account balance for repayment."},400,request);
+    const group=uid();
+    const results=await env.DB.batch([
+      env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?").bind(amount,account.id,amount),
+      env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding-? WHERE id=? AND outstanding>=?").bind(amount,card.id,amount),
+      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"card_repayment",amount,Number(account.balance)-amount,"Demo credit card repayment")
+    ]);
+    await audit(env,user,"demo_card_repayment","virtual_card",card.id,{amount});
+    return response({ok:true,message:"Demo card repayment recorded."},200,request);
+  }
+
   if (method === "GET" && path === "/api/notifications") {
     const rows=await env.DB.prepare("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
     return response({notifications:rows.results||[]},200,request);
