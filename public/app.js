@@ -30,7 +30,7 @@ $("#loanForm").addEventListener("submit",async e=>{e.preventDefault();try{const 
 $("#cardForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);["monthlyIncome","monthlyExpenses","existingEmi","existingDebt","loanOutstanding"].forEach(k=>d[k]=Number(d[k]||0));const r=await api("/cards",{method:"POST",body:JSON.stringify(d)});e.target.reset();closeApplicationModal();await loadDashboard();notice(`${r.message} Suggested limit: N₹${money(r.suggestedLimit*100)}.`)}catch(err){notice(err.message,true)}});
 $("#refreshAdmin").addEventListener("click",()=>Promise.all([loadAdmin(),loadMoneyRequests(),loadClosureRequests()]).catch(e=>notice(e.message,true)));
 $("#offerForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=formData(e.target);await api("/admin/offers",{method:"POST",body:JSON.stringify(d)});e.target.reset();await loadOffers();notice("Demo offer published.");}catch(err){notice(err.message,true)}});
-async function loadOffers(){const d=await api("/offers");const offers=d.offers||[];const grid=$("#offersGrid");grid.innerHTML=offers.filter(x=>me?.role==="admin"||Number(x.active)===1).map(x=>`<article class="offer-card"><div class="offer-top"><span class="offer-category">${esc(x.category)}</span><span class="offer-star">✦</span></div><h3>${esc(x.title)}</h3><p>${esc(x.description)}</p>${x.benefit?`<div class="offer-benefit">${esc(x.benefit)}</div>`:""}<button class="btn ${x.category==="Personal Loan"?"primary":"secondary"}" type="button" onclick="offerAction('${esc(x.category)}')">${esc(x.cta_label||"Explore offer")} →</button></article>`).join("")||'<p class="empty">No active offers right now.</p>';
+async function loadOffers(){let d;try{d=await api("/offers")}catch(e){const g=$("#offersGrid");if(g)g.innerHTML=`<p class="load-error">Offers could not load: ${esc(e.message)}</p>`;throw e;}const offers=d.offers||[];const grid=$("#offersGrid");grid.innerHTML=offers.filter(x=>me?.role==="admin"||Number(x.active)===1).map(x=>`<article class="offer-card"><div class="offer-top"><span class="offer-category">${esc(x.category)}</span><span class="offer-star">✦</span></div><h3>${esc(x.title)}</h3><p>${esc(x.description)}</p>${x.benefit?`<div class="offer-benefit">${esc(x.benefit)}</div>`:""}<button class="btn ${x.category==="Personal Loan"?"primary":"secondary"}" type="button" onclick="offerAction('${esc(x.category)}')">${esc(x.cta_label||"Explore offer")} →</button></article>`).join("")||'<p class="empty">No active offers right now.</p>';
 const admin=$("#adminOffers");if(admin)admin.innerHTML=me?.role==="admin"?offers.map(x=>`<div class="activity-item"><div><strong>${esc(x.title)}</strong><small>${esc(x.category)} · ${Number(x.active)===1?"Active":"Inactive"}</small></div><button class="btn ghost" type="button" onclick="toggleOffer('${esc(x.id)}',${Number(x.active)===1?"false":"true"})">${Number(x.active)===1?"Deactivate":"Activate"}</button></div>`).join(""):'<p class="empty">Admin access required.</p>';
 }
 function openApplicationModal(type){
@@ -74,7 +74,7 @@ function renderAccountInfo(){
   if($("#infoCustomerId"))$("#infoCustomerId").textContent = me?.id ? String(me.id).slice(0,8).toUpperCase() : "—";
   if($("#infoAccountNumber"))$("#infoAccountNumber").textContent = account.account_number || "No account found";
   if($("#infoAccountType"))$("#infoAccountType").textContent = account.account_type || account.type || "Everyday Demo Account";
-  $("#infoAccountStatus").innerHTML = `<span class="status ${account.status==="active"?"status-active":""}">${esc(account.status || "Unknown")}</span>`;
+  if($("#infoAccountStatus"))$("#infoAccountStatus").innerHTML = `<span class="status ${account.status==="active"?"status-active":""}">${esc(account.status || "Unknown")}</span>`;
   if($("#infoOpenedAt"))$("#infoOpenedAt").textContent = displayDate(account.opened_at || account.created_at);
   if($("#infoBalance"))$("#infoBalance").textContent = "N₹ " + money(accounts.reduce((sum,a)=>sum+Number(a.balance||0),0));
 }
@@ -84,19 +84,72 @@ $("#copyAccountNumber")?.addEventListener("click",async()=>{
   try{ await navigator.clipboard.writeText(accountNumber); notice("Account number copied."); }
   catch{ notice("Copy is unavailable in this browser. Account number: " + accountNumber, true); }
 });
-async function loadDashboard(){const d=await api("/me");me=d.user;setAuth(false);const userName=$("#userName"),roleBadge=$("#roleBadge"),adminPanel=$("#adminPanel");if(userName)userName.textContent=me.display_name||me.displayName||me.username;if(roleBadge)roleBadge.textContent=(me.role||"customer").toUpperCase();adminPanel?.classList.toggle("hidden",me.role!=="admin");
-const [a,t,l,c,p]=await Promise.all([api("/accounts"),api("/transactions"),api("/loans"),api("/cards"),api("/products")]);accounts=a.accounts||[];const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);const balanceEl=$("#balance"),heroBalance=$("#heroBalance"),txCount=$("#txCount"),loanCount=$("#loanCount"),cardCount=$("#cardCount");if(balanceEl)balanceEl.textContent=money(total);if(heroBalance)heroBalance.textContent=money(total);renderAccountInfo();if(txCount)txCount.textContent=(t.transactions||[]).length;if(loanCount)loanCount.textContent=(l.applications||[]).length;if(cardCount)cardCount.textContent=(c.applications||[]).length;
-const accountNumberEl=$("#accountNumber"),fromAccountEl=$("#fromAccount");if(accountNumberEl)accountNumberEl.textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";if(fromAccountEl)fromAccountEl.innerHTML=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
-const accountOptions=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";["#depositAccount","#withdrawAccount"].forEach(sel=>{if($(sel))$(sel).innerHTML=accountOptions});
-$("#transactions").innerHTML=(t.transactions||[]).slice(0,8).map(x=>`<div class="activity-item"><div><strong>${esc(x.description||x.type)}</strong><small>${esc(x.created_at||"")}</small></div><span class="amount ${String(x.type).includes("in")||x.type==="deposit"?"positive":"negative"}">${String(x.type).includes("in")||x.type==="deposit"?"+":"−"} N₹${money(x.amount)}</span></div>`).join("")||'<p class="empty">No transactions yet. This is a fresh demo account.</p>';
-window.__transactions=t.transactions||[];renderStatement(window.__transactions);
-renderApplications(l.applications||[],c.applications||[]);renderProducts(p,l.applications||[],c.applications||[]);
-const liveLoans=(p.loans||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));const liveCards=(p.cards||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));
-if($("#overviewCreditOutstanding"))$("#overviewCreditOutstanding").textContent=liveCards.length?`N₹ ${money(liveCards.reduce((n,x)=>n+Number(x.outstanding||0),0))}`:"No card yet";
-if($("#overviewLoanOutstanding"))$("#overviewLoanOutstanding").textContent=liveLoans.length?`N₹ ${money(liveLoans.reduce((n,x)=>n+Number(x.outstanding_amount||0),0))}`:"No active loan";
-if($("#overviewCreditAction"))$("#overviewCreditAction").textContent=liveCards.length?"View credit card":"Apply for credit card";
-if($("#overviewLoanAction"))$("#overviewLoanAction").textContent=liveLoans.length?"View loan details":"Explore loans";
-await loadOffers();await loadMoneyRequests();await loadClosureRequests();if(me.role==="admin")await loadAdmin();}
+async function loadDashboard(){
+  const d=await api("/me"); me=d.user; setAuth(false);
+  const userName=$("#userName"),roleBadge=$("#roleBadge"),adminPanel=$("#adminPanel");
+  if(userName)userName.textContent=me.display_name||me.displayName||me.username;
+  if(roleBadge)roleBadge.textContent=(me.role||"customer").toUpperCase();
+  adminPanel?.classList.toggle("hidden",me.role!=="admin");
+  setupSeparateViews();
+  const read=async(path,fallback,selector,label)=>{
+    try{return await api(path)}catch(err){
+      const el=selector?$(selector):null;
+      if(el)el.innerHTML=`<p class="load-error">${esc(label)} could not load: ${esc(err.message)}. Please refresh or contact the demo administrator.</p>`;
+      return fallback;
+    }
+  };
+  const [a,t,l,c,p]=await Promise.all([
+    read("/accounts",{accounts:[]},null,"Accounts"),
+    read("/transactions",{transactions:[]},"#transactions","Transactions"),
+    read("/loans",{applications:[]},"#applications","Loan applications"),
+    read("/cards",{applications:[]},"#applications","Card applications"),
+    read("/products",{loans:[],cards:[]},"#productsGrid","Cards and loans")
+  ]);
+  accounts=a.accounts||[]; const total=accounts.reduce((s,x)=>s+Number(x.balance||0),0);
+  const balanceEl=$("#balance"),heroBalance=$("#heroBalance"),txCount=$("#txCount"),loanCount=$("#loanCount"),cardCount=$("#cardCount");
+  if(balanceEl)balanceEl.textContent=money(total); if(heroBalance)heroBalance.textContent=money(total); renderAccountInfo();
+  if(txCount)txCount.textContent=(t.transactions||[]).length; if(loanCount)loanCount.textContent=(l.applications||[]).length; if(cardCount)cardCount.textContent=(c.applications||[]).length;
+  const accountNumberEl=$("#accountNumber"),fromAccountEl=$("#fromAccount");
+  if(accountNumberEl)accountNumberEl.textContent=accounts[0]?`Account • ${accounts[0].account_number}`:"No account";
+  const accountOptions=accounts.filter(x=>x.status==="active").map(x=>`<option value="${esc(x.id)}">${esc(x.account_number)} · N₹${money(x.balance)}</option>`).join("")||"<option value=''>No active account</option>";
+  if(fromAccountEl)fromAccountEl.innerHTML=accountOptions;
+  ["#depositAccount","#withdrawAccount"].forEach(sel=>{if($(sel))$(sel).innerHTML=accountOptions});
+  const txBox=$("#transactions"); if(txBox)txBox.innerHTML=(t.transactions||[]).slice(0,8).map(x=>`<div class="activity-item"><div><strong>${esc(x.description||x.type)}</strong><small>${esc(x.created_at||"")}</small></div><span class="amount ${String(x.type).includes("in")||x.type==="deposit"?"positive":"negative"}">${String(x.type).includes("in")||x.type==="deposit"?"+":"−"} N₹${money(x.amount)}</span></div>`).join("")||'<p class="empty">No transactions yet.</p>';
+  window.__transactions=t.transactions||[]; renderStatement(window.__transactions);
+  renderApplications(l.applications||[],c.applications||[]); renderProducts(p,l.applications||[],c.applications||[]);
+  const liveLoans=(p.loans||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));
+  const liveCards=(p.cards||[]).filter(x=>!['closed'].includes(String(x.status).toLowerCase()));
+  if($("#overviewCreditOutstanding"))$("#overviewCreditOutstanding").textContent=liveCards.length?`N₹ ${money(liveCards.reduce((n,x)=>n+Number(x.outstanding||0),0))}`:"No card yet";
+  if($("#overviewLoanOutstanding"))$("#overviewLoanOutstanding").textContent=liveLoans.length?`N₹ ${money(liveLoans.reduce((n,x)=>n+Number(x.outstanding_amount||0),0))}`:"No active loan";
+  if($("#overviewCreditAction"))$("#overviewCreditAction").textContent=liveCards.length?"View credit card":"Apply for credit card";
+  if($("#overviewLoanAction"))$("#overviewLoanAction").textContent=liveLoans.length?"View loan details":"Explore loans";
+  await Promise.allSettled([loadOffers(),loadMoneyRequests(),loadClosureRequests()]);
+  if(me.role==="admin")await loadAdmin().catch(e=>notice("Admin data could not load: "+e.message,true));
+  applyCurrentView();
+}
+function setupSeparateViews(){
+  const nav=$(".quick-nav"); if(!nav||nav.dataset.ready)return; nav.dataset.ready="1";
+  nav.innerHTML=`<a href="#overview" data-view="overview">Overview</a><a href="#transactionsPanel" data-view="transactions">Transactions</a><a href="#cardsLoansPanel" data-view="products">Cards &amp; Loans</a><a href="#transferForm" data-view="transfer">Transfer &amp; Payments</a><a href="#applicationsPanel" data-view="requests">Your Requests</a><a href="#accountInfoTitle" data-view="account">Account Info</a>`;
+  nav.addEventListener("click",e=>{const link=e.target.closest("a[data-view]");if(!link)return;e.preventDefault();history.replaceState(null,"",link.getAttribute("href"));applyCurrentView(link.dataset.view);window.scrollTo({top:0,behavior:"smooth"})});
+}
+function applyCurrentView(forced){
+  const nav=$(".quick-nav"); if(!nav)return; const hash=location.hash||"#overview";
+  const map={"#overview":"overview","#transactionsPanel":"transactions","#cardsLoansPanel":"products","#transferForm":"transfer","#applicationsPanel":"requests","#accountInfoTitle":"account","#transactions":"transactions","#transfer":"transfer"};
+  const view=forced||map[hash]||"overview";
+  const all=Array.from(document.querySelectorAll("#dashboard .panel, #dashboard .account-info-section, #dashboard .offers-section, #dashboard .work-grid"));
+  all.forEach(el=>el.classList.add("view-hidden"));
+  const show=sel=>{const el=$(sel);if(el)el.classList.remove("view-hidden")};
+  if(view==="overview"){show("#overview");show(".overview-stats");show(".offers-section");}
+  if(view==="transactions"){show("#transactionsPanel");show(".statement-panel");}
+  if(view==="products"){show("#cardsLoansPanel");}
+  if(view==="transfer"){["#transferForm","#depositForm","#withdrawForm"].forEach(sel=>{const form=$(sel);if(form){const section=form.closest("section");section?.classList.remove("view-hidden")}});}
+  if(view==="requests"){show("#applicationsPanel");const req=$("#moneyRequests")?.closest("section");req?.classList.remove("view-hidden");const closure=$("#customerClosureRequests")?.closest("section");closure?.classList.remove("view-hidden");}
+  if(view==="account")show(".account-info-section");
+  if(me?.role==="admin"&&view==="admin")show("#adminPanel");
+  nav.querySelectorAll("a[data-view]").forEach(a=>a.classList.toggle("active",a.dataset.view===view));
+  if(view!=="admin")$("#adminPanel")?.classList.add("view-hidden");
+}
+
 function transactionDirection(x){const t=String(x.type||"").toLowerCase();return (t.includes("in")||["deposit","loan_disbursement","refund","credit"].includes(t))?"credit":"debit"}
 function filteredStatement(rows){const from=$("#statementFrom")?.value||"",to=$("#statementTo")?.value||"",type=$("#statementType")?.value||"all";return rows.filter(x=>{const date=String(x.created_at||"").slice(0,10);return (!from||date>=from)&&(!to||date<=to)&&(type==="all"||transactionDirection(x)===type)}).sort((a,b)=>String(b.created_at||"").localeCompare(String(a.created_at||"")))}
 function renderStatement(rows){const filtered=filteredStatement(rows||[]);const credits=filtered.filter(x=>transactionDirection(x)==="credit").reduce((n,x)=>n+Number(x.amount||0),0);const debits=filtered.filter(x=>transactionDirection(x)==="debit").reduce((n,x)=>n+Number(x.amount||0),0);const summary=$("#statementSummary");if(summary)summary.innerHTML=`<span>Entries <b>${filtered.length}</b></span><span>Credits <b class="positive">N₹ ${money(credits)}</b></span><span>Debits <b class="negative">N₹ ${money(debits)}</b></span>`;const tbody=$("#statementRows");if(!tbody)return;tbody.innerHTML=filtered.map(x=>`<tr><td>${esc(displayDate(x.created_at)||"—")}</td><td>${esc(x.description||x.type||"Transaction")}</td><td>${esc(String(x.type||"").replaceAll("_"," "))}</td><td class="${transactionDirection(x)==="credit"?"positive":"negative"}">${transactionDirection(x)==="credit"?"+":"−"} N₹ ${money(x.amount)}</td><td>N₹ ${money(x.balance_after)}</td></tr>`).join("")||'<tr><td colspan="5">No transactions match these filters.</td></tr>'}
@@ -107,7 +160,7 @@ function statusInfo(status){
 }
 function renderApplications(loans,cards){
  const items=[...loans.map(x=>({...x,kind:"Loan",amount:x.requested_amount,approved:x.sanctioned_amount,submitted:x.created_at,note:x.admin_note,unit:"loan"})),...cards.map(x=>({...x,kind:"Credit card",amount:x.requested_limit,approved:x.sanctioned_limit,submitted:x.created_at,note:x.admin_note,unit:"card"}))].sort((a,b)=>String(b.submitted||"").localeCompare(String(a.submitted||"")));
- $("#applications").innerHTML=items.map(x=>{const info=statusInfo(x.status);const isLoan=x.unit==="loan";const requested=isLoan?money(x.amount):"Bank assessment";const sanctioned=x.approved==null?"Not decided":money(x.approved);const stages=isLoan?["pending","verified","approved","disbursed"]:["pending","verified","approved","active"];const pos=stages.indexOf(x.status);const stageIndex=x.status==="need_documents"?1:x.status==="rejected"?-1:Math.max(0,pos);return `<article class="application-track"><div class="application-track-head"><div><strong>${x.kind}</strong><small>Submitted ${esc(displayDate(x.submitted))}</small></div><span class="status status-${esc(x.status)}">${esc(info[0])}</span></div><div class="application-amounts"><span>Requested <b>N₹ ${requested}</b></span><span>${isLoan?"Sanctioned amount":"Sanctioned limit"} <b>${x.approved==null?"—":"N₹ "+sanctioned}</b></span></div><div class="timeline">${stages.map((s,i)=>`<div class="timeline-step ${x.status!=="rejected"&&i<=stageIndex?"done":""}"><i></i><span>${esc(statusInfo(s)[0])}</span></div>`).join("")}</div><p class="application-status-copy">${esc(info[1])}</p>${x.note?`<p class="admin-note"><b>Review note:</b> ${esc(x.note)}</p>`:""}${isLoan&&x.status==="approved"?`<button class="btn primary full-btn" type="button" onclick="acceptDemoLoan('${esc(x.id)}')">Accept &amp; disburse demo loan →</button>`:""}</article>`}).join("")||'<p class="empty">No applications yet. Explore Offers for You to apply for a demo loan or credit card.</p>';
+ if($("#applications"))$("#applications").innerHTML=items.map(x=>{const info=statusInfo(x.status);const isLoan=x.unit==="loan";const requested=isLoan?money(x.amount):"Bank assessment";const sanctioned=x.approved==null?"Not decided":money(x.approved);const stages=isLoan?["pending","verified","approved","disbursed"]:["pending","verified","approved","active"];const pos=stages.indexOf(x.status);const stageIndex=x.status==="need_documents"?1:x.status==="rejected"?-1:Math.max(0,pos);return `<article class="application-track"><div class="application-track-head"><div><strong>${x.kind}</strong><small>Submitted ${esc(displayDate(x.submitted))}</small></div><span class="status status-${esc(x.status)}">${esc(info[0])}</span></div><div class="application-amounts"><span>Requested <b>N₹ ${requested}</b></span><span>${isLoan?"Sanctioned amount":"Sanctioned limit"} <b>${x.approved==null?"—":"N₹ "+sanctioned}</b></span></div><div class="timeline">${stages.map((s,i)=>`<div class="timeline-step ${x.status!=="rejected"&&i<=stageIndex?"done":""}"><i></i><span>${esc(statusInfo(s)[0])}</span></div>`).join("")}</div><p class="application-status-copy">${esc(info[1])}</p>${x.note?`<p class="admin-note"><b>Review note:</b> ${esc(x.note)}</p>`:""}${isLoan&&x.status==="approved"?`<button class="btn primary full-btn" type="button" onclick="acceptDemoLoan('${esc(x.id)}')">Accept &amp; disburse demo loan →</button>`:""}</article>`}).join("")||'<p class="empty">No applications yet. Explore Offers for You to apply for a demo loan or credit card.</p>';
 }
 function renderProducts(products,loans,cards){
  const account=accounts[0];const debit=account?`<article class="product-card debit-product"><div class="product-card-top"><span class="product-chip">DEBIT · DEMO</span><span class="product-status">${esc(account.status||"active")}</span></div><div class="demo-card-brand">Nova<span>Bank</span></div><div class="masked-card-number">•••• &nbsp;•••• &nbsp;•••• &nbsp;${esc(String(account.account_number||"").slice(-4))}</div><div class="product-card-bottom"><div><small>ACCOUNT HOLDER</small><b>${esc(me?.display_name||me?.displayName||me?.username||"Customer")}</b></div><div><small>LINKED ACCOUNT</small><b>${esc(String(account.account_number||""))}</b></div></div><p class="tiny muted">Fictional debit card preview only. No real card number or payment network.</p></article>`:`<div class="product-empty"><h4>Demo debit card</h4><p>No account is linked yet.</p></div>`;
