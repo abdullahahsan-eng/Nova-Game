@@ -787,10 +787,9 @@ async function route(request, env) {
         const loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
         if(!loan) return response({error:"Loan is no longer awaiting closure."},409,request);
         if(status==='approved') {
-          await env.DB.batch([
-            env.DB.prepare("UPDATE demo_loans SET outstanding_amount=0,remaining_months=0,status='closed',updated_at=datetime('now') WHERE id=? AND status='closure_pending'").bind(loan.id),
-            env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=?").bind(loan.application_id,r.user_id)
-          ]);
+          const changed=await env.DB.prepare("UPDATE demo_loans SET outstanding_amount=0,remaining_months=0,status='closed',updated_at=datetime('now') WHERE id=? AND user_id=? AND status='closure_pending'").bind(loan.id,r.user_id).run();
+          if(!Number(changed.meta?.changes||0)) return response({error:"Loan closure could not be approved because its status changed. Refresh and review again."},409,request);
+          await env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=?").bind(loan.application_id,r.user_id).run();
         } else {
           const acct=await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=?").bind(loan.account_id,r.user_id).first();
           if(!acct) return response({error:"Linked demo account not found; cannot safely reverse payment."},409,request);
@@ -805,8 +804,13 @@ async function route(request, env) {
       } else {
         const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
         if(!card) return response({error:"Card is no longer awaiting closure."},409,request);
-        if(status==='approved') await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND outstanding=0").bind(card.id,r.user_id).run();
-        else await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
+        if(status==='approved') {
+          const changed=await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
+          if(!Number(changed.meta?.changes||0)) return response({error:"Card closure could not be approved: confirm the card is still pending and its outstanding is zero."},409,request);
+        } else {
+          const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
+          if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed before rejection. Refresh and review again."},409,request);
+        }
       }
       await env.DB.prepare("UPDATE product_closure_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(status,note,user.id,r.id).run();
       await notify(env,r.user_id,`${r.product_type==='loan'?'Loan':'Card'} closure ${status}`,status==='approved'?"Your demo product has been closed and removed from active products.":`Your closure request was rejected. ${note}`);
