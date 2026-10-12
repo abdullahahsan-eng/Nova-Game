@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS loan_applications (
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','need_documents','verified','approved','rejected','accepted','disbursed','closed')),
   admin_note TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS card_applications (
@@ -71,7 +72,8 @@ CREATE TABLE IF NOT EXISTS card_applications (
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','need_documents','verified','approved','rejected','accepted','active','blocked','closed')),
   admin_note TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS virtual_cards (
@@ -103,3 +105,25 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_date ON audit_events(created_at DESC);
+
+
+-- Internal fictional treasury ledger. Worker also creates/migrates these tables lazily.
+CREATE TABLE IF NOT EXISTS treasury_accounts (
+  id TEXT PRIMARY KEY, account_number TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+  current_balance INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS treasury_ledger (
+  id TEXT PRIMARY KEY, transaction_group TEXT NOT NULL, type TEXT NOT NULL, amount INTEGER NOT NULL DEFAULT 0,
+  balance_after INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT '',
+  source_id TEXT NOT NULL DEFAULT '', actor_user_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), reference TEXT UNIQUE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_treasury_ledger_reference ON treasury_ledger(reference) WHERE reference IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_treasury_single_opening_balance ON treasury_ledger(type) WHERE type='opening_balance';
+CREATE TABLE IF NOT EXISTS treasury_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS card_control_requests (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), card_id TEXT NOT NULL REFERENCES virtual_cards(id),
+  action TEXT NOT NULL CHECK(action IN ('block','unblock')), status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+  note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
+);

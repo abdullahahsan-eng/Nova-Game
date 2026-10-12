@@ -56,6 +56,9 @@ async function ensureTreasury(env) {
   )`).run();
   await env.DB.prepare("INSERT OR IGNORE INTO treasury_accounts(id,account_number,name,current_balance) VALUES('nova-treasury-main','NB-TREASURY-0001','NovaBank Treasury',0)").run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS treasury_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`).run();
+  await ensureColumn(env, "treasury_ledger", "reference", "TEXT");
+  await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_treasury_ledger_reference ON treasury_ledger(reference) WHERE reference IS NOT NULL").run();
+  await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_treasury_single_opening_balance ON treasury_ledger(type) WHERE type='opening_balance'").run();
   const migrated = await env.DB.prepare("SELECT value FROM treasury_meta WHERE key='legacy_ledger_migrated'").first();
   if (!migrated) {
     await env.DB.prepare(`INSERT OR IGNORE INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id,created_at)
@@ -73,11 +76,12 @@ async function ensureTreasury(env) {
 }
 async function postTreasury(env, actor, type, signedAmount, description, sourceType='', sourceId='', groupId='') {
   await ensureTreasury(env);
-  const current = await env.DB.prepare("SELECT current_balance FROM treasury_accounts WHERE id='nova-treasury-main'").first();
-  const amount = Math.round(Number(signedAmount)||0), after = Number(current?.current_balance||0)+amount;
+  const current = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger").first();
+  const amount = Math.round(Number(signedAmount)||0), balance = Number(current?.balance||0), after = balance + amount;
+  if (amount < 0 && after < 0) throw new Error('Insufficient Treasury Funds. Disbursement blocked.');
   const group = groupId || uid();
   await env.DB.batch([
-    env.DB.prepare("UPDATE treasury_accounts SET current_balance=current_balance+?,updated_at=datetime('now') WHERE id='nova-treasury-main'").bind(amount),
+    env.DB.prepare("UPDATE treasury_accounts SET current_balance=?,updated_at=datetime('now') WHERE id='nova-treasury-main'").bind(after),
     env.DB.prepare("INSERT INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(uid(),group,type,amount,after,String(description||'').slice(0,240),sourceType,sourceId,actor?.id||null)
   ]);
 }
@@ -389,8 +393,41 @@ async function route(request, env) {
     await ensureTreasury(env);
     const account=await env.DB.prepare("SELECT * FROM treasury_accounts WHERE id='nova-treasury-main'").first();
     const rows=await env.DB.prepare("SELECT * FROM treasury_ledger ORDER BY created_at DESC LIMIT 500").all();
-    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COUNT(*) AS entries FROM treasury_ledger").first();
+    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COALESCE(SUM(amount),0) AS balance,COUNT(*) AS entries FROM treasury_ledger").first();
+    account.current_balance=Number(totals?.balance||0);
     return response({account,transactions:rows.results||[],totals:totals||{}},200,request);
+  }
+  if (method === "POST" && path === "/api/admin/treasury/fund") {
+    if (!user || user.role !== "admin") return response({error:"Authenticated admin permission required."},403,request);
+    await ensureTreasury(env);
+    const d = await body(request);
+    const kind = String(d.kind || "manual_funding");
+    const amountRupees = Number(d.amount);
+    const source = String(d.source || "").trim().slice(0,100);
+    const remarks = String(d.remarks || "").trim().slice(0,240);
+    if (!Number.isFinite(amountRupees) || amountRupees <= 0 || amountRupees > 1000000000 || Math.round(amountRupees * 100) <= 0)
+      return response({error:"Enter a valid funding amount greater than zero (maximum ₹1,00,00,00,000)."},400,request);
+    if (!remarks) return response({error:"Remarks are required for the audit trail."},400,request);
+    if (!['opening_balance','manual_funding'].includes(kind)) return response({error:"Unsupported funding type."},400,request);
+    const opening = await env.DB.prepare("SELECT COUNT(*) AS n FROM treasury_ledger WHERE type='opening_balance'").first();
+    if (kind === 'opening_balance' && Number(opening?.n || 0) > 0)
+      return response({error:"Opening balance has already been recorded. Use Admin Manual Funding for additional funds."},409,request);
+    const existing = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger").first();
+    const balance = Number(existing?.balance || 0), amount = Math.round(amountRupees * 100), after = balance + amount;
+    const reference = `NVT-${crypto.randomUUID().replace(/-/g,'').slice(0,16).toUpperCase()}`;
+    const entryId = uid();
+    try {
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id,reference) VALUES(?,?,?,?,?,?,?,?,?,?)")
+          .bind(entryId, reference, kind, amount, after, remarks, source || (kind === 'opening_balance' ? 'Opening Balance' : 'Admin Manual Funding'), reference, user.id, reference),
+        env.DB.prepare("UPDATE treasury_accounts SET current_balance=?,updated_at=datetime('now') WHERE id='nova-treasury-main'").bind(after)
+      ]);
+      await audit(env,user,kind === 'opening_balance' ? 'treasury_opening_balance_added' : 'treasury_manual_funding_added','treasury_account','nova-treasury-main',{reference,amount,source,remarks,balanceAfter:after});
+      return response({ok:true,reference,balance:after,message:`Funding recorded. Reference: ${reference}`},201,request);
+    } catch (e) {
+      console.error('Treasury funding error:',e);
+      return response({error:"Funding could not be recorded. Refresh Treasury and check the ledger before retrying."},500,request);
+    }
   }
 
   if (method === "GET" && path === "/api/accounts") {
@@ -713,6 +750,10 @@ async function route(request, env) {
     const account = await env.DB.prepare("SELECT * FROM accounts WHERE user_id=? AND status='active' ORDER BY opened_at LIMIT 1").bind(user.id).first();
     if (!account) return response({ error: "No active demo account is available." }, 400, request);
     const id=uid(), amount=Number(loan.sanctioned_amount), tenure=Number(loan.tenure_months), monthly=Math.ceil(amount/tenure), group=uid();
+    await ensureTreasury(env);
+    const treasuryFunds = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger").first();
+    const availableTreasury = Number(treasuryFunds?.balance || 0);
+    if (availableTreasury < amount) return response({error:`Insufficient Treasury Funds. Available N₹${(availableTreasury/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}; required N₹${(amount/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}. Add funds before disbursement.`},409,request);
     await env.DB.batch([
       env.DB.prepare("INSERT INTO demo_loans(id,application_id,user_id,account_id,principal_amount,outstanding_amount,tenure_months,remaining_months,monthly_payment,status) VALUES(?,?,?,?,?,?,?,?,?,'active')").bind(id,loan.id,user.id,account.id,amount,amount,tenure,tenure,monthly),
       env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=?").bind(amount,account.id,user.id),
