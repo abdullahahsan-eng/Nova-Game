@@ -108,6 +108,37 @@ async function ensureCardColumns(env) {
   await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "virtual_cards", "demo_number", "TEXT NOT NULL DEFAULT ''");
 }
+async function ensureCardBillPayments(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS card_bill_payments (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    transaction_group TEXT NOT NULL UNIQUE,
+    payer_user_id TEXT NOT NULL REFERENCES users(id),
+    card_owner_user_id TEXT NOT NULL REFERENCES users(id),
+    account_id TEXT NOT NULL REFERENCES accounts(id),
+    card_id TEXT NOT NULL REFERENCES virtual_cards(id),
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    account_balance_before INTEGER NOT NULL,
+    card_outstanding_before INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','completed')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TRIGGER IF NOT EXISTS validate_card_bill_payment_completion
+    BEFORE UPDATE OF status ON card_bill_payments
+    WHEN NEW.status='completed' AND OLD.status='pending'
+    BEGIN
+      SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM accounts WHERE id=NEW.account_id AND balance=NEW.account_balance_before-NEW.amount)
+        THEN RAISE(ABORT,'Card bill payer account debit is incomplete') END;
+      SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM virtual_cards WHERE id=NEW.card_id AND outstanding=NEW.card_outstanding_before-NEW.amount)
+        THEN RAISE(ABORT,'Card bill outstanding update is incomplete') END;
+      SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM ledger WHERE transaction_group=NEW.transaction_group AND type='card_bill_payment')
+        THEN RAISE(ABORT,'Card bill account ledger entry is missing') END;
+      SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM card_transactions WHERE transaction_group=NEW.transaction_group AND type='bill_payment')
+        THEN RAISE(ABORT,'Card bill transaction history is missing') END;
+      SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM treasury_ledger WHERE transaction_group=NEW.transaction_group AND type='card_bill_payment')
+        THEN RAISE(ABORT,'Treasury ledger entry is missing') END;
+    END`).run();
+}
 async function route(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -161,15 +192,16 @@ async function route(request, env) {
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), product_type TEXT NOT NULL CHECK(product_type IN ('loan','card')),
     product_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
     amount_paid INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id), deleted_at TEXT
   )`).run();
+  await ensureColumn(env, "product_closure_requests", "deleted_at", "TEXT");
   await ensureColumn(env, "offers", "deleted_at", "TEXT").catch(()=>{});
   await ensureColumn(env, "loan_applications", "deleted_at", "TEXT").catch(()=>{});
   await ensureColumn(env, "card_applications", "deleted_at", "TEXT").catch(()=>{});
   if (method === "GET" && path === "/api/closure-requests") {
     const rows = user.role === "admin"
-      ? await env.DB.prepare(`SELECT r.*,u.display_name,u.username FROM product_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all()
-      : await env.DB.prepare("SELECT * FROM product_closure_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
+      ? await env.DB.prepare(`SELECT r.*,u.display_name,u.username FROM product_closure_requests r JOIN users u ON u.id=r.user_id WHERE r.deleted_at IS NULL ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all()
+      : await env.DB.prepare("SELECT * FROM product_closure_requests WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
     return response({requests:rows.results||[]},200,request);
   }
   const loanClosure = path.match(/^\/api\/loans\/([^/]+)\/closure-request$/);
@@ -203,7 +235,6 @@ async function route(request, env) {
     const duplicate=await env.DB.prepare("SELECT id FROM product_closure_requests WHERE product_type='card' AND product_id=? AND status='pending'").bind(card.id).first();
     if(duplicate) return response({error:"A card closure request is already awaiting admin review."},409,request);
     const reqId=uid(); await env.DB.prepare("INSERT INTO product_closure_requests(id,user_id,product_type,product_id,status,note) VALUES(?,?, 'card',?,'pending','Outstanding is zero; awaiting admin closure approval')").bind(reqId,user.id,card.id).run();
-    await env.DB.prepare("UPDATE virtual_cards SET status='closure_pending' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
     await notify(env,user.id,"Card closure request submitted","Your demo card closure request is awaiting admin review.");
     await audit(env,user,"card_closure_requested","virtual_card",card.id,{requestId:reqId});
     return response({ok:true,requestId:reqId,message:"Card closure request submitted. It will disappear from Cards & Loans after admin approval."},201,request);
@@ -583,32 +614,64 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/card-bill") {
     await ensureCardColumns(env);
-    const last4=String(url.searchParams.get("last4")||"").toUpperCase();
+    const last4=String(url.searchParams.get("last4")||"").trim().toUpperCase();
     if(!/^[A-Z0-9]{4}$/.test(last4)) return response({error:"Enter the last four characters of a demo card."},400,request);
-    const card=await env.DB.prepare("SELECT id,credit_limit,outstanding,status,demo_number FROM virtual_cards WHERE user_id=? AND status IN ('active','inactive') AND (substr(demo_number,-4)=? OR substr(replace(masked_number,' ',''),-4)=?) ORDER BY created_at DESC LIMIT 1").bind(user.id,last4,last4).first();
-    if(!card) return response({error:"No linked demo credit card matches those last four characters."},404,request);
-    return response({ok:true,cardId:card.id,cardName:"Nova Rewards Card",outstanding:Number(card.outstanding||0),availableCredit:Math.max(0,Number(card.credit_limit||0)-Number(card.outstanding||0)),status:card.status},200,request);
+    const rows=await env.DB.prepare(`SELECT c.id,c.user_id,c.masked_number,c.credit_limit,c.outstanding,c.status,c.demo_number,u.display_name,u.username
+      FROM virtual_cards c JOIN users u ON u.id=c.user_id
+      WHERE (upper(substr(COALESCE(c.demo_number,''),-4))=? OR upper(substr(replace(COALESCE(c.masked_number,''),' ',''),-4))=?)
+      ORDER BY c.outstanding DESC,c.created_at DESC LIMIT 50`).bind(last4,last4).all();
+    const matches=(rows.results||[]).map(c=>({cardId:c.id,cardName:"Nova Rewards Card",maskedNumber:c.masked_number||(`•••• •••• •••• ${last4}`),cardholderName:c.display_name||c.username||"Cardholder",username:c.username,outstanding:Number(c.outstanding||0),availableCredit:Math.max(0,Number(c.credit_limit||0)-Number(c.outstanding||0)),status:c.status}));
+    if(!matches.length) return response({error:"No registered demo credit card matches those last four characters."},404,request);
+    return response({ok:true,last4,matches},200,request);
   }
   if (method === "POST" && path === "/api/card-bill/pay") {
-    const d=await body(request), amount=Math.round(Number(d.amount)*100);
-    if(!d.cardId||!Number.isSafeInteger(amount)||amount<100) return response({error:"Enter a valid card and bill payment amount."},400,request);
-    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active'").bind(String(d.cardId),user.id).first();
-    if(!card) return response({error:"Active linked demo card not found."},404,request);
-    if(amount>Number(card.outstanding||0)) return response({error:"Payment cannot exceed the current card outstanding."},400,request);
-    const account=await env.DB.prepare("SELECT * FROM accounts WHERE user_id=? AND status='active' ORDER BY created_at LIMIT 1").bind(user.id).first();
-    if(!account||Number(account.balance)<amount) return response({error:"Insufficient demo account balance to pay this bill."},400,request);
-    const nextBalance=Number(account.balance)-amount, nextOutstanding=Number(card.outstanding)-amount, group=uid(), ledgerId=uid();
-    const batch=await env.DB.batch([
-      env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?").bind(amount,account.id,amount),
-      env.DB.prepare("UPDATE virtual_cards SET outstanding=? WHERE id=? AND outstanding>=?").bind(nextOutstanding,card.id,amount),
-      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(ledgerId,account.id,group,"card_bill_payment",amount,nextBalance,"Demo credit card bill payment")
-    ]);
-    if(batch.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Payment could not be completed safely. Refresh and try again."},409,request);
-    await ensureCardTransactions(env);
-    await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,group,"bill_payment",amount,"Demo credit card bill payment").run();
-    await postTreasury(env,user,"card_bill_payment",amount,`Demo credit card bill payment · ${card.id}`,"virtual_card",card.id,group);
-    await audit(env,user,"demo_card_bill_payment","virtual_card",card.id,{amount,transactionGroup:group});
-    return response({ok:true,message:`Demo card bill payment successful. Remaining outstanding N₹${(nextOutstanding/100).toFixed(2)}.`,transactionId:group},200,request);
+    await ensureCardColumns(env); await ensureCardTransactions(env); await ensureTreasury(env); await ensureCardBillPayments(env);
+    const d=await body(request), amount=Math.round(Number(d.amount)*100), cardId=String(d.cardId||""), accountId=String(d.accountId||""), key=String(d.idempotencyKey||"");
+    if(!cardId||!accountId||!Number.isSafeInteger(amount)||amount<100) return response({error:"Choose a card, your own source account, and a payment amount of at least N₹1."},400,request);
+    if(!/^[A-Za-z0-9._:-]{16,100}$/.test(key)) return response({error:"A valid payment confirmation reference is required. Please refresh and try again."},400,request);
+    const previous=await env.DB.prepare("SELECT status,transaction_group,amount FROM card_bill_payments WHERE idempotency_key=? AND payer_user_id=?").bind(key,user.id).first();
+    if(previous?.status==='completed') return response({ok:true,alreadyProcessed:true,transactionId:previous.transaction_group,message:`This payment was already processed once. No duplicate debit was made. Amount: N₹${(Number(previous.amount)/100).toFixed(2)}.`},200,request);
+    if(previous) return response({error:"This payment reference is already in use. Refresh the bill and start a new confirmation."},409,request);
+    const account=await env.DB.prepare("SELECT id,user_id,account_number,balance,status FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(accountId,user.id).first();
+    if(!account) return response({error:"Select one of your own active NovaBank accounts."},403,request);
+    const card=await env.DB.prepare("SELECT id,user_id,masked_number,credit_limit,outstanding,status FROM virtual_cards WHERE id=?").bind(cardId).first();
+    if(!card) return response({error:"Registered demo credit card not found."},404,request);
+    if(amount>Number(card.outstanding||0)) return response({error:"Payment cannot exceed the latest card outstanding. Fetch the bill again."},400,request);
+    if(Number(account.balance)<amount) return response({error:"Insufficient balance in the selected source account."},400,request);
+    const paymentId=uid(), group=uid(), ledgerId=uid(), cardTxId=uid(), treasuryId=uid(), auditId=uid();
+    const description=`Credit-card bill payment · ${card.masked_number||card.id} · paid by ${user.username}`;
+    let results;
+    try { results=await env.DB.batch([
+      env.DB.prepare(`INSERT INTO card_bill_payments(id,idempotency_key,transaction_group,payer_user_id,card_owner_user_id,account_id,card_id,amount,account_balance_before,card_outstanding_before,status)
+        SELECT ?,?,?,?,?,?,?,?,?,?,'pending' FROM accounts a JOIN virtual_cards c ON c.id=?
+        WHERE a.id=? AND a.user_id=? AND a.status='active' AND a.balance>=? AND c.outstanding>=?
+        ON CONFLICT(idempotency_key) DO NOTHING`).bind(paymentId,key,group,user.id,card.user_id,account.id,card.id,amount,Number(account.balance),Number(card.outstanding),card.id,account.id,user.id,amount,amount),
+      env.DB.prepare(`UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND status='active' AND balance=? AND EXISTS(SELECT 1 FROM card_bill_payments p WHERE p.id=? AND p.status='pending' AND p.account_id=accounts.id)`).bind(amount,account.id,user.id,Number(account.balance),paymentId),
+      env.DB.prepare(`UPDATE virtual_cards SET outstanding=outstanding-? WHERE id=? AND outstanding=? AND EXISTS(SELECT 1 FROM card_bill_payments p WHERE p.id=? AND p.status='pending' AND p.card_id=virtual_cards.id) AND EXISTS(SELECT 1 FROM accounts a JOIN card_bill_payments p ON p.account_id=a.id WHERE p.id=? AND a.balance=p.account_balance_before-p.amount)`).bind(amount,card.id,Number(card.outstanding),paymentId,paymentId),
+      env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description)
+        SELECT ?,a.id,?,'card_bill_payment',?,a.balance,? FROM accounts a JOIN card_bill_payments p ON p.account_id=a.id JOIN virtual_cards c ON c.id=p.card_id
+        WHERE p.id=? AND p.status='pending' AND a.balance=p.account_balance_before-p.amount AND c.outstanding=p.card_outstanding_before-p.amount`).bind(ledgerId,group,amount,description,paymentId),
+      env.DB.prepare(`INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description)
+        SELECT ?,c.id,c.user_id,?,'bill_payment',?,? FROM virtual_cards c JOIN card_bill_payments p ON p.card_id=c.id JOIN accounts a ON a.id=p.account_id
+        WHERE p.id=? AND p.status='pending' AND a.balance=p.account_balance_before-p.amount AND c.outstanding=p.card_outstanding_before-p.amount`).bind(cardTxId,group,amount,`Bill payment received · payer ${user.username} · source ${account.account_number}`,paymentId),
+      env.DB.prepare(`INSERT INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id,reference)
+        SELECT ?,?, 'card_bill_payment',?,COALESCE((SELECT SUM(amount) FROM treasury_ledger),0)+?,?,'virtual_card',?, ?,?
+        WHERE EXISTS(SELECT 1 FROM card_bill_payments p JOIN accounts a ON a.id=p.account_id JOIN virtual_cards c ON c.id=p.card_id WHERE p.id=? AND p.status='pending' AND a.balance=p.account_balance_before-p.amount AND c.outstanding=p.card_outstanding_before-p.amount)
+        ON CONFLICT(reference) DO NOTHING`).bind(treasuryId,group,amount,amount,description,card.id,user.id,`card-bill-${paymentId}`,paymentId),
+      env.DB.prepare("UPDATE treasury_accounts SET current_balance=COALESCE((SELECT SUM(amount) FROM treasury_ledger),0),updated_at=datetime('now') WHERE id='nova-treasury-main' AND EXISTS(SELECT 1 FROM treasury_ledger WHERE id=? AND transaction_group=?)").bind(treasuryId,group),
+      env.DB.prepare("UPDATE card_bill_payments SET status='completed' WHERE id=? AND status='pending'").bind(paymentId),
+      env.DB.prepare(`INSERT INTO audit_events(id,actor_user_id,action,target_type,target_id,details) SELECT ?,?,'demo_card_bill_payment','virtual_card',?,? WHERE EXISTS(SELECT 1 FROM card_bill_payments WHERE id=? AND status='completed')`).bind(auditId,user.id,card.id,JSON.stringify({amount,accountId:account.id,payerUserId:user.id,cardOwnerUserId:card.user_id,transactionGroup:group}),paymentId)
+    ]); } catch (e) { return response({error:"Payment could not be completed safely. No partial payment was committed; fetch the bill and try again."},409,request); }
+    const inserted=Number(results?.[0]?.meta?.changes||0);
+    const completed=await env.DB.prepare("SELECT status,amount,transaction_group FROM card_bill_payments WHERE id=? AND idempotency_key=?").bind(paymentId,key).first();
+    if(!inserted||completed?.status!=='completed') {
+      const existing=await env.DB.prepare("SELECT status,transaction_group,amount FROM card_bill_payments WHERE idempotency_key=? AND payer_user_id=?").bind(key,user.id).first();
+      if(existing?.status==='completed') return response({ok:true,alreadyProcessed:true,transactionId:existing.transaction_group,message:"This payment was already processed. No duplicate debit was made."},200,request);
+      return response({error:"Payment was not completed. No successful payment was recorded; fetch the latest bill and try again."},409,request);
+    }
+    const remaining=Number(card.outstanding)-amount;
+    await notify(env,card.user_id,"Credit card bill payment received",`N₹${(amount/100).toFixed(2)} was paid toward card ${card.masked_number||card.id}. Remaining demo outstanding: N₹${(remaining/100).toFixed(2)}.`);
+    return response({ok:true,message:`Credit card bill payment successful. Remaining outstanding: N₹${(remaining/100).toFixed(2)}.`,transactionId:group,remainingOutstanding:remaining},200,request);
   }
   if (method === "POST" && path === "/api/account-closure-requests") {
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT 'pending',note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id))`).run();
@@ -838,11 +901,30 @@ async function route(request, env) {
       return response({ok:true,message:`Card ${r.action} request ${status}.`},200,request);
     }
 
+    const closureArchive = path.match(/^\/api\/admin\/closure-requests\/([^/]+)\/archive$/);
+    if (closureArchive) {
+      await ensureColumn(env,"product_closure_requests","deleted_at","TEXT");
+      const req=await env.DB.prepare("SELECT * FROM product_closure_requests WHERE id=? AND deleted_at IS NULL").bind(closureArchive[1]).first();
+      if(!req) return response({error:"Closure request is already hidden or was not found."},404,request);
+      if(req.product_type==='loan' && req.status==='pending') return response({error:"This loan foreclosure has already deducted funds. Review it first so the payment is approved or safely reversed before hiding the request."},409,request);
+      if(req.product_type==='card' && req.status==='pending') {
+        const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(req.product_id,req.user_id).first();
+        if(!card) return response({error:"Card record not found; cannot safely archive this request."},404,request);
+        if(Number(card.outstanding)>0) return response({error:"This card has outstanding dues. Resolve the card before archiving its pending closure request."},409,request);
+        if(card.status==='closure_pending') await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,req.user_id).run();
+        else if(!['active','inactive','blocked'].includes(card.status)) return response({error:`Cannot archive a pending closure request while the card status is ${card.status}.`},409,request);
+      }
+      const changed=await env.DB.prepare("UPDATE product_closure_requests SET deleted_at=datetime('now') WHERE id=? AND deleted_at IS NULL").bind(req.id).run();
+      if(!Number(changed.meta?.changes||0)) return response({error:"Request changed while archiving. Refresh the queue."},409,request);
+      await audit(env,user,"product_closure_request_soft_deleted","product_closure_request",req.id,{productType:req.product_type,productId:req.product_id,status:req.status,reason:String(d.note||"Hidden from active review list").slice(0,250)});
+      return response({ok:true,message:"Closure request hidden from the active review list. Request and financial history are preserved."},200,request);
+    }
+
     const closureReview = path.match(/^\/api\/admin\/closure-requests\/([^/]+)\/review$/);
     if (closureReview) {
       const status=String(d.status||""), note=String(d.note||"").trim().slice(0,250);
       if(!["approved","rejected"].includes(status)) return response({error:"Choose approve or reject."},400,request);
-      const r=await env.DB.prepare("SELECT * FROM product_closure_requests WHERE id=? AND status='pending'").bind(closureReview[1]).first();
+      const r=await env.DB.prepare("SELECT * FROM product_closure_requests WHERE id=? AND status='pending' AND deleted_at IS NULL").bind(closureReview[1]).first();
       if(!r) return response({error:"Pending closure request not found."},404,request);
       if(r.product_type==='loan') {
         const loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
@@ -865,24 +947,27 @@ async function route(request, env) {
       } else {
         const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(r.product_id,r.user_id).first();
         if(!card) return response({error:"Card record not found. Refresh the queue and inspect the customer history."},404,request);
+        if(Number(card.outstanding||0)!==0) return response({error:`Card closure requires zero outstanding. Current outstanding is N₹${(Number(card.outstanding||0)/100).toFixed(2)}.`},409,request);
         if(status==='approved') {
-          if(card.status==='closed' && Number(card.outstanding)===0) { /* Idempotent approval: product was already closed. */ }
-          else {
-            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
-            if(!Number(changed.meta?.changes||0)) return response({error:`Card closure cannot be approved: current status is ${card.status} and outstanding is N₹${(Number(card.outstanding||0)/100).toFixed(2)}. Refresh and inspect the card before retrying.`},409,request);
+          if(card.status!=='closed') {
+            if(!['closure_pending','active','inactive','blocked'].includes(card.status)) return response({error:`Card cannot be closed from its current status (${card.status}). Refresh and inspect the card.`},409,request);
+            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='closed' WHERE id=? AND user_id=? AND status=? AND outstanding=0").bind(card.id,r.user_id,card.status).run();
+            if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed during approval. Refresh and review again."},409,request);
           }
         } else {
-          // Rejection should remain reviewable if a concurrent/admin action already
-          // returned the card to inactive. Never overwrite a newly closed/blocked card.
+          // A pending closure request is not the card itself. If an older build
+          // marked the card closure_pending, restore it to inactive; otherwise keep
+          // the current usable/blocked state instead of failing on a status mismatch.
           if(card.status==='closure_pending') {
-            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,r.user_id).run();
-            if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed during review. Refresh and review again."},409,request);
-          } else if(card.status!=='inactive') {
-            return response({error:`Card closure cannot be rejected because its current status is ${card.status}. Refresh and inspect the card.`},409,request);
+            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
+            if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed during rejection. Refresh and review again."},409,request);
+          } else if(!['active','inactive','blocked'].includes(card.status)) {
+            return response({error:`Card closure cannot be rejected because the card is ${card.status}. Inspect the card before retrying.`},409,request);
           }
         }
       }
-      await env.DB.prepare("UPDATE product_closure_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(status,note,user.id,r.id).run();
+      const requestChanged=await env.DB.prepare("UPDATE product_closure_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending' AND deleted_at IS NULL").bind(status,note,user.id,r.id).run();
+      if(!Number(requestChanged.meta?.changes||0)) return response({error:"Closure request was already reviewed or hidden. Refresh the queue."},409,request);
       await notify(env,r.user_id,`${r.product_type==='loan'?'Loan':'Card'} closure ${status}`,status==='approved'?"Your demo product has been closed and removed from active products.":`Your closure request was rejected. ${note}`);
       await audit(env,user,`${r.product_type}_closure_${status}`,r.product_type,r.product_id,{requestId:r.id,note});
       return response({ok:true,message:`Closure request ${status}.`},200,request);
