@@ -112,6 +112,30 @@ async function route(request, env) {
     amount_paid INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
   )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS card_control_requests (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), card_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('unblock')), status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+    note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
+  )`).run();
+  const unblockRequestMatch = path.match(/^\/api\/cards\/([^/]+)\/unblock-request$/);
+  if (method === "POST" && unblockRequestMatch) {
+    const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='blocked'").bind(unblockRequestMatch[1],user.id).first();
+    if (!card) return response({error:"Only a blocked demo card can request unblocking."},404,request);
+    const existing = await env.DB.prepare("SELECT id FROM card_control_requests WHERE card_id=? AND user_id=? AND action='unblock' AND status='pending'").bind(card.id,user.id).first();
+    if (existing) return response({error:"An unblock request is already awaiting admin review."},409,request);
+    const id=uid();
+    await env.DB.prepare("INSERT INTO card_control_requests(id,user_id,card_id,action,status,note) VALUES(?,?,?,'unblock','pending','Customer requested card unblock')").bind(id,user.id,card.id).run();
+    await notify(env,user.id,"Card unblock request submitted","Your card remains blocked until the Super Admin reviews your request.");
+    await audit(env,user,"card_unblock_requested","virtual_card",card.id,{requestId:id});
+    return response({ok:true,requestId:id,message:"Unblock request submitted. Your card remains blocked until admin approval."},201,request);
+  }
+  if (method === "GET" && path === "/api/card-control-requests") {
+    const rows = user.role === "admin"
+      ? await env.DB.prepare("SELECT r.*,u.display_name,u.username,c.masked_number FROM card_control_requests r JOIN users u ON u.id=r.user_id LEFT JOIN virtual_cards c ON c.id=r.card_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300").all()
+      : await env.DB.prepare("SELECT * FROM card_control_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
+    return response({requests:rows.results||[]},200,request);
+  }
   if (method === "GET" && path === "/api/closure-requests") {
     const rows = user.role === "admin"
       ? await env.DB.prepare(`SELECT r.*,u.display_name,u.username FROM product_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all()
@@ -664,6 +688,20 @@ async function route(request, env) {
     if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
     const d = await body(request);
 
+    const cardControlReview = path.match(/^\/api\/admin\/card-control-requests\/([^/]+)\/review$/);
+    if (cardControlReview) {
+      const status=String(d.status||""), note=String(d.note||"").trim().slice(0,250);
+      if(!["approved","rejected"].includes(status)) return response({error:"Choose approve or reject."},400,request);
+      const r=await env.DB.prepare("SELECT * FROM card_control_requests WHERE id=? AND status='pending'").bind(cardControlReview[1]).first();
+      if(!r) return response({error:"Pending card-control request not found."},404,request);
+      const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='blocked'").bind(r.card_id,r.user_id).first();
+      if(!card) return response({error:"Card is no longer blocked; refresh the request queue."},409,request);
+      if(status==='approved') await env.DB.prepare("UPDATE virtual_cards SET status='active' WHERE id=? AND user_id=? AND status='blocked'").bind(card.id,r.user_id).run();
+      await env.DB.prepare("UPDATE card_control_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(status,note,user.id,r.id).run();
+      await notify(env,r.user_id,`Card unblock request ${status}`,status==='approved'?"Your demo card has been unblocked by the Super Admin.":`Your card remains blocked. ${note}`);
+      await audit(env,user,`card_unblock_${status}`,"virtual_card",card.id,{requestId:r.id,note});
+      return response({ok:true,message:status==='approved'?"Card unblocked.":"Unblock request rejected; card remains blocked."},200,request);
+    }
     const closureReview = path.match(/^\/api\/admin\/closure-requests\/([^/]+)\/review$/);
     if (closureReview) {
       const status=String(d.status||""), note=String(d.note||"").trim().slice(0,250);
@@ -784,8 +822,9 @@ async function route(request, env) {
   const cardBlockMatch = path.match(/^\/api\/cards\/([^/]+)\/block$/);
   if (method === "POST" && cardBlockMatch) {
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardBlockMatch[1],user.id).first();
-    if (!card) return response({error:"Virtual card not found."},404,request);
-    await env.DB.prepare("UPDATE virtual_cards SET status='blocked' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
+    if (!card || !["active","inactive","blocked"].includes(card.status)) return response({error:"This card cannot be blocked in its current status."},404,request);
+    if (card.status === "blocked") return response({ok:true,message:"This demo card is already blocked."},200,request);
+    await env.DB.prepare("UPDATE virtual_cards SET status='blocked' WHERE id=? AND user_id=? AND status IN ('active','inactive')").bind(card.id,user.id).run();
     await audit(env,user,"demo_card_blocked","virtual_card",card.id);
     return response({ok:true,message:"Demo card blocked."},200,request);
   }
