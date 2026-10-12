@@ -108,6 +108,28 @@ async function ensureCardColumns(env) {
   await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "virtual_cards", "demo_number", "TEXT NOT NULL DEFAULT ''");
 }
+// Repair legacy cards whose stored outstanding is zero even though recorded card
+// activity shows an unpaid balance. Never overwrite a non-zero stored balance.
+async function reconcileZeroCardOutstanding(env, userId = null) {
+  await ensureCardTransactions(env);
+  const scope = userId ? " AND c.user_id=?" : "";
+  const sql = `UPDATE virtual_cards AS c
+    SET outstanding = (
+      SELECT MAX(0, COALESCE(SUM(CASE
+        WHEN t.type IN ('joining_fee','purchase','funded_transfer','transfer_fee') THEN t.amount
+        WHEN t.type IN ('repayment','bill_payment') THEN -t.amount
+        ELSE 0 END),0))
+      FROM card_transactions t WHERE t.card_id=c.id
+    )
+    WHERE c.outstanding=0 ${scope}
+      AND EXISTS (SELECT 1 FROM card_transactions t WHERE t.card_id=c.id)
+      AND (SELECT COALESCE(SUM(CASE
+        WHEN t.type IN ('joining_fee','purchase','funded_transfer','transfer_fee') THEN t.amount
+        WHEN t.type IN ('repayment','bill_payment') THEN -t.amount
+        ELSE 0 END),0) FROM card_transactions t WHERE t.card_id=c.id) > 0`;
+  if (userId) await env.DB.prepare(sql).bind(userId).run();
+  else await env.DB.prepare(sql).run();
+}
 async function ensureCardBillPayments(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS card_bill_payments (
     id TEXT PRIMARY KEY,
@@ -614,6 +636,7 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/card-bill") {
     await ensureCardColumns(env);
+    await reconcileZeroCardOutstanding(env);
     const last4=String(url.searchParams.get("last4")||"").trim().toUpperCase();
     if(!/^[A-Z0-9]{4}$/.test(last4)) return response({error:"Enter the last four characters of a demo card."},400,request);
     const rows=await env.DB.prepare(`SELECT c.id,c.user_id,c.masked_number,c.credit_limit,c.outstanding,c.status,c.demo_number,u.display_name,u.username
@@ -801,6 +824,7 @@ async function route(request, env) {
       monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`).run();
+    await reconcileZeroCardOutstanding(env, user.role === "admin" ? null : user.id);
     const loans = user.role === "admin"
       ? await env.DB.prepare("SELECT * FROM demo_loans ORDER BY created_at DESC LIMIT 500").all()
       : await env.DB.prepare("SELECT * FROM demo_loans WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
