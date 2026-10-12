@@ -16,7 +16,7 @@ async function passwordHash(password, salt) {
 }
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
-  return { "access-control-allow-origin": origin, "vary": "Origin", "access-control-allow-headers": "content-type,authorization", "access-control-allow-methods": "GET,POST,PATCH,OPTIONS" };
+  return { "access-control-allow-origin": origin, "vary": "Origin", "access-control-allow-headers": "content-type,authorization", "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS" };
 }
 async function body(request) {
   try { return await request.json(); } catch { return {}; }
@@ -41,6 +41,45 @@ async function audit(env, actor, action, targetType, targetId, details = {}) {
 }
 async function notify(env, userId, title, message) {
   await env.DB.prepare("INSERT INTO notifications(id,user_id,title,message) VALUES(?,?,?,?)").bind(uid(), userId, title, message).run();
+}
+async function ensureTreasury(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS treasury_accounts (
+    id TEXT PRIMARY KEY, account_number TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+    current_balance INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS treasury_ledger (
+    id TEXT PRIMARY KEY, transaction_group TEXT NOT NULL, type TEXT NOT NULL,
+    amount INTEGER NOT NULL DEFAULT 0, balance_after INTEGER NOT NULL,
+    description TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT '', source_id TEXT NOT NULL DEFAULT '',
+    actor_user_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare("INSERT OR IGNORE INTO treasury_accounts(id,account_number,name,current_balance) VALUES('nova-treasury-main','NB-TREASURY-0001','NovaBank Treasury',0)").run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS treasury_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`).run();
+  const migrated = await env.DB.prepare("SELECT value FROM treasury_meta WHERE key='legacy_ledger_migrated'").first();
+  if (!migrated) {
+    await env.DB.prepare(`INSERT OR IGNORE INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id,created_at)
+      SELECT 'legacy-'||x.id,COALESCE(x.transaction_group,x.id),x.t_type,x.signed_amount,
+        SUM(x.signed_amount) OVER (ORDER BY x.created_at,x.id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        x.description,'legacy_ledger',x.id,NULL,x.created_at
+      FROM (SELECT l.id,l.transaction_group,l.created_at,l.description,
+        CASE l.type WHEN 'deposit' THEN 'customer_deposit' WHEN 'withdrawal' THEN 'customer_withdrawal' WHEN 'loan_disbursement' THEN 'loan_disbursement' WHEN 'loan_repayment' THEN 'loan_repayment' WHEN 'loan_foreclosure_pending' THEN 'loan_foreclosure_pending' WHEN 'loan_foreclosure' THEN 'loan_foreclosure' WHEN 'loan_foreclosure_reversal' THEN 'foreclosure_reversal' WHEN 'card_repayment' THEN 'card_repayment' WHEN 'transfer_in' THEN 'internal_transfer_in' WHEN 'transfer_out' THEN 'internal_transfer_out' ELSE l.type END AS t_type,
+        CASE l.type WHEN 'deposit' THEN l.amount WHEN 'withdrawal' THEN -l.amount WHEN 'loan_disbursement' THEN -l.amount WHEN 'loan_repayment' THEN l.amount WHEN 'loan_foreclosure_pending' THEN l.amount WHEN 'loan_foreclosure' THEN l.amount WHEN 'loan_foreclosure_reversal' THEN -l.amount WHEN 'card_repayment' THEN l.amount WHEN 'card_bill_payment' THEN l.amount ELSE 0 END AS signed_amount
+        FROM ledger l) x`).run();
+    const sum = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS n FROM treasury_ledger").first();
+    await env.DB.prepare("UPDATE treasury_accounts SET current_balance=?,updated_at=datetime('now') WHERE id='nova-treasury-main'").bind(Number(sum?.n||0)).run();
+    await env.DB.prepare("INSERT OR REPLACE INTO treasury_meta(key,value) VALUES('legacy_ledger_migrated',datetime('now'))").run();
+  }
+}
+async function postTreasury(env, actor, type, signedAmount, description, sourceType='', sourceId='', groupId='') {
+  await ensureTreasury(env);
+  const current = await env.DB.prepare("SELECT current_balance FROM treasury_accounts WHERE id='nova-treasury-main'").first();
+  const amount = Math.round(Number(signedAmount)||0), after = Number(current?.current_balance||0)+amount;
+  const group = groupId || uid();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE treasury_accounts SET current_balance=current_balance+?,updated_at=datetime('now') WHERE id='nova-treasury-main'").bind(amount),
+    env.DB.prepare("INSERT INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(uid(),group,type,amount,after,String(description||'').slice(0,240),sourceType,sourceId,actor?.id||null)
+  ]);
 }
 async function ensureColumn(env, table, column, definition) {
   const cols = await env.DB.prepare(`PRAGMA table_info(${table})`).all();
@@ -112,30 +151,9 @@ async function route(request, env) {
     amount_paid INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
   )`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS card_control_requests (
-    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), card_id TEXT NOT NULL,
-    action TEXT NOT NULL CHECK(action IN ('unblock')), status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
-    note TEXT NOT NULL DEFAULT '', admin_note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id)
-  )`).run();
-  const unblockRequestMatch = path.match(/^\/api\/cards\/([^/]+)\/unblock-request$/);
-  if (method === "POST" && unblockRequestMatch) {
-    const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='blocked'").bind(unblockRequestMatch[1],user.id).first();
-    if (!card) return response({error:"Only a blocked demo card can request unblocking."},404,request);
-    const existing = await env.DB.prepare("SELECT id FROM card_control_requests WHERE card_id=? AND user_id=? AND action='unblock' AND status='pending'").bind(card.id,user.id).first();
-    if (existing) return response({error:"An unblock request is already awaiting admin review."},409,request);
-    const id=uid();
-    await env.DB.prepare("INSERT INTO card_control_requests(id,user_id,card_id,action,status,note) VALUES(?,?,?,'unblock','pending','Customer requested card unblock')").bind(id,user.id,card.id).run();
-    await notify(env,user.id,"Card unblock request submitted","Your card remains blocked until the Super Admin reviews your request.");
-    await audit(env,user,"card_unblock_requested","virtual_card",card.id,{requestId:id});
-    return response({ok:true,requestId:id,message:"Unblock request submitted. Your card remains blocked until admin approval."},201,request);
-  }
-  if (method === "GET" && path === "/api/card-control-requests") {
-    const rows = user.role === "admin"
-      ? await env.DB.prepare("SELECT r.*,u.display_name,u.username,c.masked_number FROM card_control_requests r JOIN users u ON u.id=r.user_id LEFT JOIN virtual_cards c ON c.id=r.card_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300").all()
-      : await env.DB.prepare("SELECT * FROM card_control_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
-    return response({requests:rows.results||[]},200,request);
-  }
+  await ensureColumn(env, "offers", "deleted_at", "TEXT").catch(()=>{});
+  await ensureColumn(env, "loan_applications", "deleted_at", "TEXT").catch(()=>{});
+  await ensureColumn(env, "card_applications", "deleted_at", "TEXT").catch(()=>{});
   if (method === "GET" && path === "/api/closure-requests") {
     const rows = user.role === "admin"
       ? await env.DB.prepare(`SELECT r.*,u.display_name,u.username FROM product_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all()
@@ -160,6 +178,7 @@ async function route(request, env) {
       env.DB.prepare("INSERT INTO product_closure_requests(id,user_id,product_type,product_id,status,amount_paid,note) VALUES(?,?, 'loan',?,'pending',?,?)").bind(reqId,user.id,loan.id,amount,"Full outstanding paid; awaiting admin closure approval")
     ]);
     if(!Number(results?.[0]?.meta?.changes||0)||!Number(results?.[1]?.meta?.changes||0)||!Number(results?.[2]?.meta?.changes||0)) return response({error:"Full payment could not be recorded safely. Refresh and retry."},409,request);
+    await postTreasury(env,user,"loan_foreclosure_pending",amount,`Foreclosure payment awaiting approval · ${loan.id}`,"product_closure_request",reqId,group);
     await notify(env,user.id,"Loan closure awaiting review",`Full demo outstanding of N₹${(amount/100).toFixed(2)} has been paid. Admin confirmation is pending.`);
     await audit(env,user,"loan_closure_requested","demo_loan",loan.id,{requestId:reqId,amount});
     return response({ok:true,requestId:reqId,message:`Full payment recorded (N₹${(amount/100).toFixed(2)}). Loan will close after admin approval.`},201,request);
@@ -238,15 +257,20 @@ async function route(request, env) {
       monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`).run();
-    const [accounts, loans, cards, loanApps, cardApps, tx] = await Promise.all([
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,account_id TEXT NOT NULL,type TEXT NOT NULL,amount INTEGER NOT NULL,description TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT,review_token TEXT)`).run();
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT)`).run();
+    const [accounts, loans, cards, loanApps, cardApps, tx, closures, money, accountClosures] = await Promise.all([
       env.DB.prepare("SELECT * FROM accounts WHERE user_id=? ORDER BY opened_at DESC").bind(customerId).all(),
       env.DB.prepare("SELECT * FROM demo_loans WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
       env.DB.prepare("SELECT * FROM virtual_cards WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
-      env.DB.prepare("SELECT id,requested_amount,tenure_months,sanctioned_amount,status,admin_note,created_at,updated_at FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
-      env.DB.prepare("SELECT id,requested_limit,sanctioned_limit,status,admin_note,created_at,updated_at FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
-      env.DB.prepare("SELECT l.* FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.user_id=? ORDER BY l.created_at DESC LIMIT 50").bind(customerId).all()
+      env.DB.prepare("SELECT id,requested_amount,tenure_months,sanctioned_amount,status,admin_note,created_at,updated_at,deleted_at FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT id,requested_limit,sanctioned_limit,status,admin_note,created_at,updated_at,deleted_at FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(customerId).all(),
+      env.DB.prepare("SELECT l.* FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.user_id=? ORDER BY l.created_at DESC LIMIT 50").bind(customerId).all(),
+      env.DB.prepare("SELECT * FROM product_closure_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(customerId).all(),
+      env.DB.prepare("SELECT * FROM money_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(customerId).all(),
+      env.DB.prepare("SELECT * FROM account_closure_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(customerId).all()
     ]);
-    return response({ customer, accounts:accounts.results||[], loans:loans.results||[], cards:cards.results||[], loanApplications:loanApps.results||[], cardApplications:cardApps.results||[], transactions:tx.results||[] },200,request);
+    return response({ customer, accounts:accounts.results||[], loans:loans.results||[], cards:cards.results||[], loanApplications:loanApps.results||[], cardApplications:cardApps.results||[], transactions:tx.results||[], closureRequests:closures.results||[], moneyRequests:money.results||[], accountClosureRequests:accountClosures.results||[] },200,request);
   }
 
   const accountStatusMatch = path.match(/^\/api\/admin\/accounts\/([^/]+)\/status$/);
@@ -280,7 +304,8 @@ async function route(request, env) {
       created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`).run();
-    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM offers").first();
+    await ensureColumn(env, "offers", "deleted_at", "TEXT");
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM offers WHERE deleted_at IS NULL").first();
     if (!count || Number(count.n) === 0) {
       const seeds = [
         [uid(), "Nova Rewards Card", "Credit Card", "Explore a fictional virtual card with reward points for simulated purchases.", "Up to 5% demo rewards", "View card options", 1, ""],
@@ -290,8 +315,8 @@ async function route(request, env) {
       await env.DB.batch(seeds.map(x => env.DB.prepare("INSERT INTO offers(id,title,category,description,benefit,cta_label,active,valid_until) VALUES(?,?,?,?,?,?,?,?)").bind(...x)));
     }
     const rows = user.role === "admin"
-      ? await env.DB.prepare("SELECT * FROM offers ORDER BY created_at DESC").all()
-      : await env.DB.prepare("SELECT o.* FROM offers o WHERE o.active=1 AND (o.valid_until='' OR o.valid_until>=date('now')) AND (NOT EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id) OR EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id AND oa.user_id=?)) ORDER BY o.created_at DESC").bind(user.id).all();
+      ? await env.DB.prepare("SELECT * FROM offers WHERE deleted_at IS NULL ORDER BY created_at DESC").all()
+      : await env.DB.prepare("SELECT o.* FROM offers o WHERE o.deleted_at IS NULL AND o.active=1 AND (o.valid_until='' OR o.valid_until>=date('now')) AND (NOT EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id) OR EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id AND oa.user_id=?)) ORDER BY o.created_at DESC").bind(user.id).all();
     return response({ offers: rows.results || [] }, 200, request);
   }
 
@@ -311,6 +336,7 @@ async function route(request, env) {
       created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`).run();
+    await ensureColumn(env, "offers", "deleted_at", "TEXT");
     const d = await body(request);
     const title = String(d.title || '').trim(), category = String(d.category || '').trim(), description = String(d.description || '').trim();
     if (title.length < 3 || title.length > 90 || !["Credit Card","Personal Loan","Shopping","Rewards","Other"].includes(category) || description.length < 8 || description.length > 500)
@@ -331,6 +357,40 @@ async function route(request, env) {
     await env.DB.prepare("UPDATE offers SET active=?, updated_at=datetime('now') WHERE id=?").bind(active, current.id).run();
     await audit(env, user, active ? "offer_activated" : "offer_deactivated", "offer", current.id, { title: current.title });
     return response({ ok: true, active }, 200, request);
+  }
+
+  // Soft-delete admin catalogue/review records: retain rows for audit and customer history.
+  const offerDelete = path.match(/^\/api\/admin\/offers\/([^/]+)$/);
+  const loanApplicationDelete = path.match(/^\/api\/admin\/loans\/([^/]+)$/);
+  const cardApplicationDelete = path.match(/^\/api\/admin\/cards\/([^/]+)$/);
+  if (method === "DELETE" && (offerDelete || loanApplicationDelete || cardApplicationDelete)) {
+    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    const d = await body(request), note = String(d.note||"Removed from active review list").trim().slice(0,240);
+    if (offerDelete) {
+      await ensureColumn(env,"offers","deleted_at","TEXT");
+      const row=await env.DB.prepare("SELECT id,title FROM offers WHERE id=? AND deleted_at IS NULL").bind(offerDelete[1]).first();
+      if(!row) return response({error:"Active offer not found."},404,request);
+      await env.DB.prepare("UPDATE offers SET deleted_at=datetime('now'),active=0,updated_at=datetime('now') WHERE id=? AND deleted_at IS NULL").bind(row.id).run();
+      await audit(env,user,"offer_soft_deleted","offer",row.id,{title:row.title,note});
+      return response({ok:true,message:"Offer removed from active catalogue; audit history retained."},200,request);
+    }
+    const isLoan=!!loanApplicationDelete, table=isLoan?"loan_applications":"card_applications", id=(isLoan?loanApplicationDelete:cardApplicationDelete)[1];
+    await ensureColumn(env,table,"deleted_at","TEXT");
+    const row=await env.DB.prepare(`SELECT id,user_id,status FROM ${table} WHERE id=? AND deleted_at IS NULL`).bind(id).first();
+    if(!row) return response({error:"Active review request not found."},404,request);
+    await env.DB.prepare(`UPDATE ${table} SET deleted_at=datetime('now'),updated_at=datetime('now') WHERE id=? AND deleted_at IS NULL`).bind(id).run();
+    await audit(env,user,isLoan?"loan_application_soft_deleted":"card_application_soft_deleted",isLoan?"loan_application":"card_application",id,{status:row.status,note});
+    await notify(env,row.user_id,isLoan?"Loan review item archived":"Card review item archived","Your reviewed request was archived from the admin queue. Its history remains available.");
+    return response({ok:true,message:"Removed from active review list; audit history retained."},200,request);
+  }
+
+  if (method === "GET" && path === "/api/admin/treasury") {
+    if(user.role!=="admin") return response({error:"Admin permission required."},403,request);
+    await ensureTreasury(env);
+    const account=await env.DB.prepare("SELECT * FROM treasury_accounts WHERE id='nova-treasury-main'").first();
+    const rows=await env.DB.prepare("SELECT * FROM treasury_ledger ORDER BY created_at DESC LIMIT 500").all();
+    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COUNT(*) AS entries FROM treasury_ledger").first();
+    return response({account,transactions:rows.results||[],totals:totals||{}},200,request);
   }
 
   if (method === "GET" && path === "/api/accounts") {
@@ -463,6 +523,7 @@ async function route(request, env) {
       await env.DB.prepare("UPDATE money_requests SET status='pending',review_token=NULL,admin_note='Approval could not be completed; please review again.' WHERE id=? AND status='processing' AND review_token=?").bind(r.id,token).run();
       return response({error:'Approval could not be completed safely. Refresh and retry; no completed approval was recorded.'},409,request);
     }
+    await postTreasury(env,user,r.type==='deposit'?'customer_deposit':'customer_withdrawal',r.type==='deposit'?amount:-amount,`${r.type==='deposit'?'Customer deposit':'Customer withdrawal'} · ${r.id}`,'money_request',r.id,group);
     await notify(env,r.user_id,'Money request approved',`${r.type==='deposit'?'Deposit':'Withdrawal'} request ${r.id} approved. N₹${(amount/100).toFixed(2)} demo balance ${r.type==='deposit'?'credited':'debited'}.`);
     await audit(env,user,'money_request_approved','money_request',r.id,{type:r.type,amount,accountId:r.account_id,transactionGroup:group,note});
     return response({ok:true,message:`Request ${r.id} approved. Demo balance updated to N₹${(nextBalance/100).toFixed(2)}.`},200,request);
@@ -498,6 +559,7 @@ async function route(request, env) {
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(ledgerId,account.id,group,"card_bill_payment",amount,nextBalance,"Demo credit card bill payment")
     ]);
     if(batch.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Payment could not be completed safely. Refresh and try again."},409,request);
+    await postTreasury(env,user,"card_bill_payment",amount,`Demo credit card bill payment · ${card.id}`,"virtual_card",card.id,group);
     await audit(env,user,"demo_card_bill_payment","virtual_card",card.id,{amount,transactionGroup:group});
     return response({ok:true,message:`Demo card bill payment successful. Remaining outstanding N₹${(nextOutstanding/100).toFixed(2)}.`,transactionId:group},200,request);
   }
@@ -553,6 +615,8 @@ async function route(request, env) {
         env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(creditId,dest.id,group,"transfer_in",amount,nextDest,"Demo credit-card-funded transfer" )
       ]);
       if(results.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Transfer could not be completed safely. Refresh and retry."},409,request);
+      await postTreasury(env,user,"credit_card_funded_transfer",0,`Credit-card-funded transfer principal N₹${(amount/100).toFixed(2)}`,"transaction",group,group);
+      await postTreasury(env,user,"credit_card_transfer_fee",fee,"0.9% demo credit-card transfer fee","transaction",group,group);
       await audit(env,user,"demo_credit_card_transfer","transaction",group,{amount,fee,total,cardId:card.id,toAccount:dest.id});
       await notify(env,dest.user_id,"Money received",`N₹${(amount/100).toFixed(2)} demo transfer received.`);
       return response({ok:true,message:`Demo transfer sent. 0.9% fee: N₹${(fee/100).toFixed(2)}. Card outstanding increased by N₹${(total/100).toFixed(2)}.`,transactionId:group,fee:fee/100,total:total/100},200,request);
@@ -569,6 +633,7 @@ async function route(request, env) {
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(debitId, source.id, group, "transfer_out", amount, debitBalance, "Demo transfer to " + dest.account_number),
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(creditId, dest.id, group, "transfer_in", amount, creditBalance, "Demo transfer from " + source.account_number)
     ]);
+    await postTreasury(env,user,"internal_transfer",0,`Internal demo transfer · ${source.account_number} → ${dest.account_number}`,"transaction",group,group);
     await audit(env, user, "demo_transfer", "transaction", group, { amount, from: source.id, to: dest.id });
     await notify(env, dest.user_id, "Money received", `N₹${(amount/100).toFixed(2)} demo transfer received.`);
     return response({ ok: true, message: "Demo transfer submitted.", transactionId: group }, 200, request);
@@ -586,7 +651,8 @@ async function route(request, env) {
     return response({ ok:true, id, suggestedEligibility: eligible/100, message:"Demo application submitted for review." },201,request);
   }
   if (method === "GET" && path === "/api/loans") {
-    const rows = user.role === "admin" ? await env.DB.prepare("SELECT l.*,u.display_name,u.username FROM loan_applications l JOIN users u ON u.id=l.user_id ORDER BY l.created_at DESC").all() : await env.DB.prepare("SELECT * FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    await ensureColumn(env,"loan_applications","deleted_at","TEXT");
+    const rows = user.role === "admin" ? await env.DB.prepare("SELECT l.*,u.display_name,u.username FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NULL ORDER BY l.created_at DESC").all() : await env.DB.prepare("SELECT * FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "POST" && path === "/api/cards") {
@@ -607,7 +673,8 @@ async function route(request, env) {
     return response({ok:true,id,suggestedLimit:suggested/100,message:"Demo card application submitted for bank assessment."},201,request);
   }
   if (method === "GET" && path === "/api/cards") {
-    const rows = user.role === "admin" ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    await ensureColumn(env,"card_applications","deleted_at","TEXT");
+    const rows = user.role === "admin" ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NULL ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "GET" && path === "/api/products") {
@@ -652,6 +719,7 @@ async function route(request, env) {
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"loan_disbursement",amount,Number(account.balance)+amount,"Demo loan disbursement"),
       env.DB.prepare("UPDATE loan_applications SET status='disbursed',updated_at=datetime('now') WHERE id=? AND user_id=? AND status='approved'").bind(loan.id,user.id)
     ]);
+    await postTreasury(env,user,"loan_disbursement",-amount,`Demo loan disbursement · ${id}`,"demo_loan",id,group);
     await notify(env,user.id,"Demo loan activated",`N₹${(amount/100).toFixed(2)} demo loan added to your demo account. Monthly demo EMI: N₹${(monthly/100).toFixed(2)}.`);
     await audit(env,user,"demo_loan_disbursed","demo_loan",id,{applicationId:loan.id,amount,tenure});
     return response({ok:true,message:"Demo loan accepted and disbursed to your fictional account."},200,request);
@@ -680,6 +748,7 @@ async function route(request, env) {
       env.DB.prepare("UPDATE demo_loans SET outstanding_amount=?,remaining_months=?,status=?,updated_at=datetime('now') WHERE id=? AND user_id=?").bind(outstanding,remaining,status,loan.id,user.id),
       ...(outstanding===0?[env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=?").bind(loan.application_id,user.id)]:[])
     ]);
+    await postTreasury(env,user,"loan_repayment",amount,`Demo loan EMI repayment · ${loan.id}`,"demo_loan",loan.id,group);
     await notify(env,user.id,"Demo EMI recorded",`Your demo EMI payment of N₹${(amount/100).toFixed(2)} was recorded. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`);
     await audit(env,user,"demo_loan_repayment","demo_loan",loan.id,{amount,outstanding,remaining});
     return response({ok:true,message:`Demo EMI paid. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`},200,request);
@@ -688,20 +757,26 @@ async function route(request, env) {
     if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
     const d = await body(request);
 
-    const cardControlReview = path.match(/^\/api\/admin\/card-control-requests\/([^/]+)\/review$/);
-    if (cardControlReview) {
-      const status=String(d.status||""), note=String(d.note||"").trim().slice(0,250);
-      if(!["approved","rejected"].includes(status)) return response({error:"Choose approve or reject."},400,request);
+    const cardControlReview=path.match(/^\/api\/admin\/card-control-requests\/([^/]+)\/review$/);
+    if(cardControlReview){
+      const status=String(d.status||''),note=String(d.note||'').trim().slice(0,250);
+      if(!['approved','rejected'].includes(status)) return response({error:'Choose approve or reject.'},400,request);
       const r=await env.DB.prepare("SELECT * FROM card_control_requests WHERE id=? AND status='pending'").bind(cardControlReview[1]).first();
-      if(!r) return response({error:"Pending card-control request not found."},404,request);
-      const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='blocked'").bind(r.card_id,r.user_id).first();
-      if(!card) return response({error:"Card is no longer blocked; refresh the request queue."},409,request);
-      if(status==='approved') await env.DB.prepare("UPDATE virtual_cards SET status='active' WHERE id=? AND user_id=? AND status='blocked'").bind(card.id,r.user_id).run();
+      if(!r) return response({error:'Pending card control request not found.'},404,request);
+      const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(r.card_id,r.user_id).first();
+      if(!card) return response({error:'Card not found.'},404,request);
+      if(status==='approved'){
+        const next=r.action==='unblock'?'active':'blocked';
+        const expected=r.action==='unblock'?'blocked':'active';
+        const changed=await env.DB.prepare("UPDATE virtual_cards SET status=? WHERE id=? AND user_id=? AND status=?").bind(next,card.id,r.user_id,expected).run();
+        if(!Number(changed.meta?.changes||0)) return response({error:`Card status changed since request; expected ${expected}. Refresh and review again.`},409,request);
+      }
       await env.DB.prepare("UPDATE card_control_requests SET status=?,admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(status,note,user.id,r.id).run();
-      await notify(env,r.user_id,`Card unblock request ${status}`,status==='approved'?"Your demo card has been unblocked by the Super Admin.":`Your card remains blocked. ${note}`);
-      await audit(env,user,`card_unblock_${status}`,"virtual_card",card.id,{requestId:r.id,note});
-      return response({ok:true,message:status==='approved'?"Card unblocked.":"Unblock request rejected; card remains blocked."},200,request);
+      await notify(env,r.user_id,`Card ${r.action} request ${status}`,status==='approved'?`Your demo card is now ${r.action==='unblock'?'active':'blocked'}.`: `Your card ${r.action} request was rejected. ${note}`);
+      await audit(env,user,`card_${r.action}_${status}`,'virtual_card',r.card_id,{requestId:r.id,note});
+      return response({ok:true,message:`Card ${r.action} request ${status}.`},200,request);
     }
+
     const closureReview = path.match(/^\/api\/admin\/closure-requests\/([^/]+)\/review$/);
     if (closureReview) {
       const status=String(d.status||""), note=String(d.note||"").trim().slice(0,250);
@@ -725,6 +800,7 @@ async function route(request, env) {
             env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),acct.id,group,"loan_foreclosure_reversal",amount,after,"Reversal of rejected demo loan closure request"),
             env.DB.prepare("UPDATE demo_loans SET status='active',updated_at=datetime('now') WHERE id=? AND status='closure_pending'").bind(loan.id)
           ]);
+          await postTreasury(env,user,"foreclosure_reversal",-amount,`Rejected foreclosure reversed · ${loan.id}`,"product_closure_request",r.id,group);
         }
       } else {
         const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='closure_pending'").bind(r.product_id,r.user_id).first();
@@ -770,6 +846,7 @@ async function route(request, env) {
       ]);
       const changed=Number(results?.[0]?.meta?.changes||0), ledgerChanged=Number(results?.[1]?.meta?.changes||0), closed=Number(results?.[2]?.meta?.changes||0);
       if(!changed || !ledgerChanged || !closed) return response({ error:"Foreclosure could not be completed safely. Refresh the record and retry." },409,request);
+      await postTreasury(env,user,"admin_foreclosure",amount,`Admin-recorded loan foreclosure · ${loan.id}`,"demo_loan",loan.id,group);
       await notify(env,loan.user_id,"Demo loan foreclosed",`Your demo loan ${loan.id} was fully paid through a one-time foreclosure payment of N₹${(amount/100).toFixed(2)}. Remaining balance is N₹0.00.`);
       await audit(env,user,"demo_loan_foreclosed","demo_loan",loan.id,{amount,accountId:account.id,transactionGroup:group,oneTimePayment:true});
       return response({ok:true,message:`Loan foreclosed with one-time demo payment of N₹${(amount/100).toFixed(2)}.`,paidAmount:amount/100,remainingOutstanding:0},200,request);
@@ -809,6 +886,38 @@ async function route(request, env) {
       return response({ok:true},200,request);
     }
   }
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS card_control_requests (
+    id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),card_id TEXT NOT NULL REFERENCES virtual_cards(id),
+    action TEXT NOT NULL CHECK(action IN ('block','unblock')),status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+    note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id)
+  )`).run();
+  const cardControlRequest = path.match(/^\/api\/cards\/([^/]+)\/control-request$/);
+  if(method==='POST' && cardControlRequest){
+    const d=await body(request), action=String(d.action||'').toLowerCase();
+    if(!['block','unblock'].includes(action)) return response({error:'Choose block or unblock.'},400,request);
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status IN ('active','blocked','inactive')").bind(cardControlRequest[1],user.id).first();
+    if(!card) return response({error:'Eligible demo card not found.'},404,request);
+    if(action==='unblock' && card.status!=='blocked') return response({error:'Only a blocked card can request unblocking.'},409,request);
+    if(action==='block' && card.status!=='active') return response({error:'Only an active card can be blocked.'},409,request);
+    const duplicate=await env.DB.prepare("SELECT id FROM card_control_requests WHERE card_id=? AND action=? AND status='pending'").bind(card.id,action).first();
+    if(duplicate) return response({error:`A ${action} request is already pending for this card.`},409,request);
+    const id=uid();
+    await env.DB.prepare("INSERT INTO card_control_requests(id,user_id,card_id,action,note) VALUES(?,?,?,?,?)").bind(id,user.id,card.id,action,String(d.note||'Customer requested card control').slice(0,240)).run();
+    await notify(env,user.id,`Card ${action} request submitted`,`Your demo card ${action} request is awaiting admin review.`);
+    await audit(env,user,`card_${action}_requested`,'virtual_card',card.id,{requestId:id});
+    return response({ok:true,requestId:id,message:`Card ${action} request submitted for admin approval.`},201,request);
+  }
+  if(method==='GET' && path==='/api/card-control-requests'){
+    const rows=await env.DB.prepare("SELECT r.*,c.masked_number FROM card_control_requests r JOIN virtual_cards c ON c.id=r.card_id WHERE r.user_id=? ORDER BY r.created_at DESC LIMIT 100").bind(user.id).all();
+    return response({requests:rows.results||[]},200,request);
+  }
+  if(method==='GET' && path==='/api/admin/card-control-requests'){
+    if(user.role!=='admin') return response({error:'Admin permission required.'},403,request);
+    const rows=await env.DB.prepare(`SELECT r.*,u.display_name,u.username,c.masked_number,c.outstanding FROM card_control_requests r JOIN users u ON u.id=r.user_id JOIN virtual_cards c ON c.id=r.card_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all();
+    return response({requests:rows.results||[]},200,request);
+  }
+
   const cardActivateMatch = path.match(/^\/api\/cards\/([^/]+)\/activate$/);
   if (method === "POST" && cardActivateMatch) {
     await ensureCardColumns(env);
@@ -822,9 +931,8 @@ async function route(request, env) {
   const cardBlockMatch = path.match(/^\/api\/cards\/([^/]+)\/block$/);
   if (method === "POST" && cardBlockMatch) {
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardBlockMatch[1],user.id).first();
-    if (!card || !["active","inactive","blocked"].includes(card.status)) return response({error:"This card cannot be blocked in its current status."},404,request);
-    if (card.status === "blocked") return response({ok:true,message:"This demo card is already blocked."},200,request);
-    await env.DB.prepare("UPDATE virtual_cards SET status='blocked' WHERE id=? AND user_id=? AND status IN ('active','inactive')").bind(card.id,user.id).run();
+    if (!card) return response({error:"Virtual card not found."},404,request);
+    await env.DB.prepare("UPDATE virtual_cards SET status='blocked' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
     await audit(env,user,"demo_card_blocked","virtual_card",card.id);
     return response({ok:true,message:"Demo card blocked."},200,request);
   }
@@ -837,6 +945,7 @@ async function route(request, env) {
     if(Number(card.credit_limit)-Number(card.outstanding)<amount) return response({error:"Insufficient available demo credit."},400,request);
     const result=await env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding+? WHERE id=? AND user_id=? AND status='active' AND credit_limit-outstanding>=?").bind(amount,card.id,user.id,amount).run();
     if(!result.success || result.meta?.changes===0) return response({error:"Purchase could not be completed; refresh and try again."},409,request);
+    await postTreasury(env,user,"card_purchase",0,`Demo card purchase N₹${(amount/100).toFixed(2)} at ${merchant}`,"virtual_card",card.id,uid());
     await audit(env,user,"demo_card_purchase","virtual_card",card.id,{amount,merchant});
     await notify(env,user.id,"Demo card purchase",`N₹${(amount/100).toFixed(2)} demo purchase at ${merchant}.`);
     return response({ok:true,message:"Demo purchase recorded.",outstanding:Number(card.outstanding)+amount,availableCredit:Number(card.credit_limit)-Number(card.outstanding)-amount},200,request);
@@ -856,6 +965,7 @@ async function route(request, env) {
       env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding-? WHERE id=? AND outstanding>=?").bind(amount,card.id,amount),
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"card_repayment",amount,Number(account.balance)-amount,"Demo credit card repayment")
     ]);
+    await postTreasury(env,user,"card_repayment",amount,`Demo credit card repayment · ${card.id}`,"virtual_card",card.id,group);
     await audit(env,user,"demo_card_repayment","virtual_card",card.id,{amount});
     return response({ok:true,message:"Demo card repayment recorded."},200,request);
   }
