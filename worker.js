@@ -77,7 +77,7 @@ async function route(request, env) {
       const accountNumber = "NB" + crypto.getRandomValues(new Uint32Array(1))[0].toString().padStart(10, "0").slice(0, 10);
       await env.DB.batch([
         env.DB.prepare("INSERT INTO users(id,username,display_name,email,password_hash,password_salt) VALUES(?,?,?,?,?,?)").bind(userId, username, displayName, email, hash, salt),
-        env.DB.prepare("INSERT INTO accounts(id,user_id,account_number,balance) VALUES(?,?,?,0)").bind(accountId, userId, accountNumber)
+        env.DB.prepare("INSERT INTO accounts(id,user_id,account_number,balance,account_type) VALUES(?,?,?,0,?)").bind(accountId, userId, accountNumber, ["savings","current"].includes(String(d.accountType||"savings").toLowerCase())?String(d.accountType).toLowerCase():"savings")
       ]);
       await audit(env, { id: userId }, "customer_registered", "user", userId);
       return response({ ok: true, message: "Account created. Please log in." }, 201, request);
@@ -444,12 +444,97 @@ async function route(request, env) {
     return response({ok:true,message:`Request ${r.id} approved. Demo balance updated to N₹${(nextBalance/100).toFixed(2)}.`},200,request);
   }
 
+  if (method === "GET" && path === "/api/recipient-lookup") {
+    const number=String(url.searchParams.get("accountNumber")||"").trim();
+    if(!/^NB[0-9A-Za-z]{6,20}$/i.test(number)) return response({error:"Enter a valid demo account number."},400,request);
+    const recipient=await env.DB.prepare("SELECT a.account_number,u.display_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=? AND a.status='active'").bind(number).first();
+    if(!recipient) return response({error:"No active demo account matches that number."},404,request);
+    return response({ok:true,accountNumber:recipient.account_number,recipientName:recipient.display_name},200,request);
+  }
+  if (method === "GET" && path === "/api/card-bill") {
+    await ensureCardColumns(env);
+    const last4=String(url.searchParams.get("last4")||"").toUpperCase();
+    if(!/^[A-Z0-9]{4}$/.test(last4)) return response({error:"Enter the last four characters of a demo card."},400,request);
+    const card=await env.DB.prepare("SELECT id,credit_limit,outstanding,status,demo_number FROM virtual_cards WHERE user_id=? AND status IN ('active','inactive') AND (substr(demo_number,-4)=? OR substr(replace(masked_number,' ',''),-4)=?) ORDER BY created_at DESC LIMIT 1").bind(user.id,last4,last4).first();
+    if(!card) return response({error:"No linked demo credit card matches those last four characters."},404,request);
+    return response({ok:true,cardId:card.id,cardName:"Nova Rewards Card",outstanding:Number(card.outstanding||0),availableCredit:Math.max(0,Number(card.credit_limit||0)-Number(card.outstanding||0)),status:card.status},200,request);
+  }
+  if (method === "POST" && path === "/api/card-bill/pay") {
+    const d=await body(request), amount=Math.round(Number(d.amount)*100);
+    if(!d.cardId||!Number.isSafeInteger(amount)||amount<100) return response({error:"Enter a valid card and bill payment amount."},400,request);
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active'").bind(String(d.cardId),user.id).first();
+    if(!card) return response({error:"Active linked demo card not found."},404,request);
+    if(amount>Number(card.outstanding||0)) return response({error:"Payment cannot exceed the current card outstanding."},400,request);
+    const account=await env.DB.prepare("SELECT * FROM accounts WHERE user_id=? AND status='active' ORDER BY created_at LIMIT 1").bind(user.id).first();
+    if(!account||Number(account.balance)<amount) return response({error:"Insufficient demo account balance to pay this bill."},400,request);
+    const nextBalance=Number(account.balance)-amount, nextOutstanding=Number(card.outstanding)-amount, group=uid(), ledgerId=uid();
+    const batch=await env.DB.batch([
+      env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?").bind(amount,account.id,amount),
+      env.DB.prepare("UPDATE virtual_cards SET outstanding=? WHERE id=? AND outstanding>=?").bind(nextOutstanding,card.id,amount),
+      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(ledgerId,account.id,group,"card_bill_payment",amount,nextBalance,"Demo credit card bill payment")
+    ]);
+    if(batch.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Payment could not be completed safely. Refresh and try again."},409,request);
+    await audit(env,user,"demo_card_bill_payment","virtual_card",card.id,{amount,transactionGroup:group});
+    return response({ok:true,message:`Demo card bill payment successful. Remaining outstanding N₹${(nextOutstanding/100).toFixed(2)}.`,transactionId:group},200,request);
+  }
+  if (method === "POST" && path === "/api/account-closure-requests") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT 'pending',note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id))`).run();
+    const existing=await env.DB.prepare("SELECT id FROM account_closure_requests WHERE user_id=? AND status='pending'").bind(user.id).first();
+    if(existing)return response({error:"An account closure request is already pending."},409,request);
+    const id=uid();await env.DB.prepare("INSERT INTO account_closure_requests(id,user_id) VALUES(?,?)").bind(id,user.id).run();
+    await audit(env,user,"account_closure_requested","account",user.id,{requestId:id});
+    return response({ok:true,message:"Account closure request submitted for Super Admin review.",requestId:id},201,request);
+  }
+  if (method === "GET" && path === "/api/account-closure-requests") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT 'pending',note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id))`).run();
+    const rows=user.role==='admin'?await env.DB.prepare("SELECT r.*,u.display_name,u.username FROM account_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY r.created_at DESC").all():await env.DB.prepare("SELECT * FROM account_closure_requests WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    return response({requests:rows.results||[]},200,request);
+  }
+  const accountClosureReview = path.match(/^\/api\/admin\/account-closure-requests\/([^/]+)\/review$/);
+  if (method === "POST" && accountClosureReview) {
+    if (user.role !== "admin") return response({error:"Admin access required."},403,request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT 'pending',note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id))`).run();
+    const d=await body(request), status=String(d.status||"");
+    if(!["approved","rejected"].includes(status)) return response({error:"Choose approve or reject."},400,request);
+    const req=await env.DB.prepare("SELECT * FROM account_closure_requests WHERE id=? AND status='pending'").bind(accountClosureReview[1]).first();
+    if(!req) return response({error:"Pending account closure request not found."},404,request);
+    if(status==="approved") {
+      const activeLoan=await env.DB.prepare("SELECT id FROM demo_loans WHERE user_id=? AND status='active' AND outstanding_amount>0 LIMIT 1").bind(req.user_id).first();
+      const activeCard=await env.DB.prepare("SELECT id FROM virtual_cards WHERE user_id=? AND status IN ('active','inactive') AND outstanding>0 LIMIT 1").bind(req.user_id).first();
+      if(activeLoan||activeCard) return response({error:"Account cannot close while a demo loan or credit card has outstanding dues."},409,request);
+      await env.DB.batch([
+        env.DB.prepare("UPDATE accounts SET status='closed' WHERE user_id=? AND status='active'").bind(req.user_id),
+        env.DB.prepare("UPDATE account_closure_requests SET status='approved',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(String(d.note||"").slice(0,250),user.id,req.id)
+      ]);
+    } else await env.DB.prepare("UPDATE account_closure_requests SET status='rejected',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(String(d.note||"").slice(0,250),user.id,req.id).run();
+    await audit(env,user,"account_closure_reviewed","account_closure_request",req.id,{status,note:String(d.note||"").slice(0,250)});
+    await notify(env,req.user_id,"Account closure request updated",`Your demo account closure request was ${status}.`);
+    return response({ok:true,message:`Account closure request ${status}.`},200,request);
+  }
   if (method === "POST" && path === "/api/transfer") {
     const d = await body(request), amount = Math.round(Number(d.amount) * 100);
     if (!Number.isSafeInteger(amount) || amount < 100 || amount > 100000000) return response({ error: "Transfer amount must be between N₹1 and N₹1,000,000." }, 400, request);
-    const source = await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(d.fromAccountId, user.id).first();
     const dest = await env.DB.prepare("SELECT * FROM accounts WHERE account_number=? AND status='active'").bind(String(d.toAccountNumber || "").trim()).first();
-    if (!source || !dest || source.id === dest.id) return response({ error: "Check source and recipient account." }, 400, request);
+    if (!dest || dest.user_id===user.id) return response({ error: "Check recipient account. Transfers to your own demo account are not supported." }, 400, request);
+    if (String(d.paymentMethod||"account")==="credit_card") {
+      await ensureCardColumns(env);
+      const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active'").bind(String(d.fromCreditCardId||""),user.id).first();
+      if(!card) return response({error:"Select an active linked demo credit card."},400,request);
+      const fee=Math.round(amount*0.009), total=amount+fee, available=Number(card.credit_limit||0)-Number(card.outstanding||0);
+      if(total>available) return response({error:`Insufficient available demo credit. Transfer plus 0.9% fee requires N₹${(total/100).toFixed(2)}.`},400,request);
+      const nextOutstanding=Number(card.outstanding||0)+total, nextDest=Number(dest.balance)+amount, group=uid(), creditId=uid();
+      const results=await env.DB.batch([
+        env.DB.prepare("UPDATE virtual_cards SET outstanding=? WHERE id=? AND outstanding=? AND credit_limit-outstanding>=?").bind(nextOutstanding,card.id,card.outstanding,total),
+        env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND status='active'").bind(amount,dest.id),
+        env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(creditId,dest.id,group,"transfer_in",amount,nextDest,"Demo credit-card-funded transfer" )
+      ]);
+      if(results.some(x=>!Number(x?.meta?.changes||0))) return response({error:"Transfer could not be completed safely. Refresh and retry."},409,request);
+      await audit(env,user,"demo_credit_card_transfer","transaction",group,{amount,fee,total,cardId:card.id,toAccount:dest.id});
+      await notify(env,dest.user_id,"Money received",`N₹${(amount/100).toFixed(2)} demo transfer received.`);
+      return response({ok:true,message:`Demo transfer sent. 0.9% fee: N₹${(fee/100).toFixed(2)}. Card outstanding increased by N₹${(total/100).toFixed(2)}.`,transactionId:group,fee:fee/100,total:total/100},200,request);
+    }
+    const source = await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(d.fromAccountId, user.id).first();
+    if (!source || source.id === dest.id) return response({ error: "Check source and recipient account." }, 400, request);
     if (source.balance < amount) return response({ error: "Insufficient demo balance." }, 400, request);
     // MVP batch pattern; concurrency/ledger invariants require a dedicated hardening pass before any public launch.
     const group = uid(), debitId = uid(), creditId = uid();
