@@ -7,8 +7,6 @@ function formData(form){return Object.fromEntries(new FormData(form).entries())}
 function setAuth(show){const auth=$("#authPanel"),dashboard=$("#dashboard"),logout=$("#logoutBtn");auth?.classList.toggle("hidden",!show);dashboard?.classList.toggle("hidden",show);logout?.classList.toggle("hidden",show)}
 $("#loginForm").addEventListener("submit",async e=>{e.preventDefault();try{const d=await api("/login",{method:"POST",body:JSON.stringify(formData(e.target))});token=d.token;localStorage.setItem("novabank_token",token);await loadDashboard();notice("Welcome back to NovaBank.");}catch(err){notice(err.message,true)}});
 $("#registerForm").addEventListener("submit",async e=>{e.preventDefault();try{await api("/register",{method:"POST",body:JSON.stringify(formData(e.target))});e.target.reset();notice("Demo account created. Ab sign in karein.");}catch(err){notice(err.message,true)}});
-$("#customerLoginLink")?.addEventListener("click",()=>{ $("#loginMode").value="customer"; $("#loginForm h2")?.replaceChildren(document.createTextNode("Customer Login")); });
-$("#adminLoginLink")?.addEventListener("click",()=>{ $("#loginMode").value="admin"; const h=$("#loginForm")?.closest(".auth-card")?.querySelector("h2"); if(h)h.textContent="Admin Login"; });
 $("#forgotToggle")?.addEventListener("click",()=>$("#recoveryForm")?.classList.toggle("hidden"));
 $("#recoveryForm")?.addEventListener("submit",async e=>{e.preventDefault();try{const r=await api("/password-recovery",{method:"POST",body:JSON.stringify(formData(e.target))});e.target.reset();notice(r.message);$("#recoveryForm")?.classList.add("hidden");}catch(err){notice(err.message,true)}});
 async function loadRecoveryRequests(){const host=$("#adminRecoveryRequests");if(!host||me?.role!=="admin")return;try{const d=await api("/admin/password-recovery");host.innerHTML=(d.requests||[]).map(r=>{const id=esc(r.id);let actions='<span class="status">Reviewed</span>';if(r.status==="pending")actions='<div class="form-row"><input id="temp-'+id+'" type="password" minlength="10" maxlength="128" placeholder="Temporary password (10+ chars)"><button class="btn secondary" type="button" data-id="'+id+'" onclick="resetRecovery(this.dataset.id)">Approve &amp; reset</button><button class="btn ghost" type="button" data-id="'+id+'" onclick="rejectRecovery(this.dataset.id)">Reject</button></div>';return '<div class="activity-item"><div><strong>'+esc(r.display_name)+' · '+esc(r.username)+'</strong><small>'+esc(r.account_number||'No account number')+' · '+esc(r.status)+' · '+esc(r.created_at)+'</small><small>'+esc(r.email||'')+'</small></div>'+actions+'</div>';}).join('')||'<p class="empty">No recovery requests.</p>';}catch(err){host.textContent=err.message;}}
@@ -16,8 +14,6 @@ window.resetRecovery=async id=>{const input=$("#temp-"+CSS.escape(id));const tem
 window.rejectRecovery=async id=>{if(!confirm("Is recovery request ko reject karna hai?"))return;try{await api(`/admin/password-recovery/${encodeURIComponent(id)}/reject`,{method:"POST",body:JSON.stringify({note:"Rejected after admin review"})});notice("Recovery request rejected.");await loadRecoveryRequests();}catch(err){notice(err.message,true)}};
 $("#refreshRecovery")?.addEventListener("click",()=>loadRecoveryRequests().catch(e=>notice(e.message,true)));
 
-$("#customerLoginLink")?.addEventListener("click",()=>{ $("#loginMode").value="customer"; $("#loginForm h2")?.replaceChildren(document.createTextNode("Customer Login")); });
-$("#adminLoginLink")?.addEventListener("click",()=>{ $("#loginMode").value="admin"; const h=$("#loginForm")?.closest(".auth-card")?.querySelector("h2"); if(h)h.textContent="Admin Login"; });
 $("#forgotToggle")?.addEventListener("click",()=>$("#recoveryForm")?.classList.toggle("hidden"));
 $("#recoveryForm")?.addEventListener("submit",async e=>{e.preventDefault();try{const r=await api("/password-recovery",{method:"POST",body:JSON.stringify(formData(e.target))});e.target.reset();notice(r.message);$("#recoveryForm")?.classList.add("hidden");}catch(err){notice(err.message,true)}});
 
@@ -186,18 +182,27 @@ document.querySelectorAll(".quick-nav [data-view]").forEach(a=>a.addEventListene
 const accountClosureBtn=$("#requestAccountClosure");accountClosureBtn?.addEventListener("click",()=>notice("Account closure request UI is ready, but this action needs a matching backend endpoint before it can be submitted. Contact the Super Admin for now.",true));
 
 
-// Landing-page controls: keep login and account-opening forms off the homepage until requested.
+// v14: modal-based customer access; admin entry stays in the separate admin portal.
 (function landingPageControls(){
- const panel=document.querySelector('#authPanel'), login=document.querySelector('#loginCard'), register=document.querySelector('#registerCard');
- function showAuth(which){if(!panel)return;panel.classList.remove('hidden');login?.classList.toggle('hidden',which!=='login');register?.classList.toggle('hidden',which!=='register');const mode=document.querySelector('#loginMode');if(mode)mode.value=which==='admin'?'admin':'customer';const heading=login?.querySelector('h2');if(heading)heading.textContent=which==='admin'?'Admin Login':'Customer Login';panel.scrollIntoView({behavior:'smooth',block:'start'});}
+ const backdrop=document.querySelector('#authModalBackdrop'), mount=document.querySelector('#authModalMount'), panel=document.querySelector('#authPanel');
+ const login=document.querySelector('#loginCard'), register=document.querySelector('#registerCard');
+ if(panel&&mount&&!mount.contains(panel))mount.appendChild(panel);
+ function closeAuth(){backdrop?.classList.add('hidden');document.body.classList.remove('modal-open');}
+ function showAuth(which){if(!backdrop||!panel)return;panel.classList.remove('hidden');login?.classList.toggle('hidden',which!=='login');register?.classList.toggle('hidden',which!=='register');backdrop.classList.remove('hidden');document.body.classList.add('modal-open');const mode=document.querySelector('#loginMode');if(mode)mode.value='customer';const heading=login?.querySelector('h2');if(heading)heading.textContent='Customer Login';if(which==='register'){document.querySelector('#accountIntro')?.classList.remove('hidden');document.querySelector('#registerForm')?.classList.add('hidden');}}
  document.querySelector('#customerLoginLink')?.addEventListener('click',e=>{e.preventDefault();showAuth('login')});
- document.querySelector('#adminLoginLink')?.addEventListener('click',e=>{e.preventDefault();showAuth('admin')});
  document.querySelector('#heroOpenAccount')?.addEventListener('click',()=>showAuth('register'));
+ document.querySelector('#closeAuthModal')?.addEventListener('click',closeAuth);
+ backdrop?.addEventListener('click',e=>{if(e.target===backdrop)closeAuth()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop?.classList.contains('hidden'))closeAuth()});
+ document.querySelector('#continueAccountIntro')?.addEventListener('click',()=>{document.querySelector('#accountIntro')?.classList.add('hidden');document.querySelector('#registerForm')?.classList.remove('hidden');document.querySelector('#registerForm [name="displayName"]')?.focus()});
+ document.querySelector('#backAccountIntro')?.addEventListener('click',()=>{document.querySelector('#registerForm')?.classList.add('hidden');document.querySelector('#accountIntro')?.classList.remove('hidden')});
+ const accountType=document.querySelector('#accountTypeSelect'),business=document.querySelector('#businessFields');
+ function syncBusinessFields(){if(!accountType||!business)return;const current=accountType.value==='current';business.classList.toggle('hidden',!current);business.querySelectorAll('input,select').forEach(el=>{el.required=current});}
+ accountType?.addEventListener('change',syncBusinessFields);syncBusinessFields();
  document.querySelector('#heroExploreOffers')?.addEventListener('click',()=>document.querySelector('#promoCarousel')?.scrollIntoView({behavior:'smooth',block:'center'}));
  document.querySelectorAll('[data-promo-action="login"]').forEach(b=>b.addEventListener('click',()=>showAuth('login')));
  const slides=[...document.querySelectorAll('.promo-slide')],dots=[...document.querySelectorAll('.promo-dot')];let active=0,timer;
  function go(i){if(!slides.length)return;active=(i+slides.length)%slides.length;slides.forEach((s,n)=>s.classList.toggle('active',n===active));dots.forEach((d,n)=>d.classList.toggle('active',n===active));}
  function restart(){clearInterval(timer);if(!matchMedia('(prefers-reduced-motion: reduce)').matches)timer=setInterval(()=>go(active+1),5200)}
- dots.forEach((d,i)=>d.addEventListener('click',()=>{go(i);restart()}));document.querySelector('#promoPrev')?.addEventListener('click',()=>{go(active-1);restart()});document.querySelector('#promoNext')?.addEventListener('click',()=>{go(active+1);restart()});
- go(0);restart();document.querySelector('#promoCarousel')?.addEventListener('mouseenter',()=>clearInterval(timer));document.querySelector('#promoCarousel')?.addEventListener('mouseleave',restart);
+ dots.forEach((d,i)=>d.addEventListener('click',()=>{go(i);restart()}));document.querySelector('#promoPrev')?.addEventListener('click',()=>{go(active-1);restart()});document.querySelector('#promoNext')?.addEventListener('click',()=>{go(active+1);restart()});go(0);restart();document.querySelector('#promoCarousel')?.addEventListener('mouseenter',()=>clearInterval(timer));document.querySelector('#promoCarousel')?.addEventListener('mouseleave',restart);
 })();
