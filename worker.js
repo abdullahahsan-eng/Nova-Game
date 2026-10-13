@@ -684,7 +684,7 @@ async function route(request, env) {
       env.DB.prepare("UPDATE treasury_accounts SET current_balance=COALESCE((SELECT SUM(amount) FROM treasury_ledger),0),updated_at=datetime('now') WHERE id='nova-treasury-main' AND EXISTS(SELECT 1 FROM treasury_ledger WHERE id=? AND transaction_group=?)").bind(treasuryId,group),
       env.DB.prepare("UPDATE card_bill_payments SET status='completed' WHERE id=? AND status='pending'").bind(paymentId),
       env.DB.prepare(`INSERT INTO audit_events(id,actor_user_id,action,target_type,target_id,details) SELECT ?,?,'demo_card_bill_payment','virtual_card',?,? WHERE EXISTS(SELECT 1 FROM card_bill_payments WHERE id=? AND status='completed')`).bind(auditId,user.id,card.id,JSON.stringify({amount,accountId:account.id,payerUserId:user.id,cardOwnerUserId:card.user_id,transactionGroup:group}),paymentId)
-    ]); } catch (e) { return response({error:"Payment could not be completed safely. No partial payment was committed; fetch the bill and try again."},409,request); }
+    ]); } catch (e) { console.error("CARD_BILL_PAYMENT_BATCH_FAILED", { message: String(e?.message || e), stack: String(e?.stack || "") }); return response({error:"Payment could not be completed safely. No partial payment was committed; fetch the bill and try again.", reference:"CARD_BILL_PAYMENT_BATCH_FAILED"},409,request); }
     const inserted=Number(results?.[0]?.meta?.changes||0);
     const completed=await env.DB.prepare("SELECT status,amount,transaction_group FROM card_bill_payments WHERE id=? AND idempotency_key=?").bind(paymentId,key).first();
     if(!inserted||completed?.status!=='completed') {
