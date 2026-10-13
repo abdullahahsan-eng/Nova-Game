@@ -169,6 +169,21 @@ async function route(request, env) {
 
   // Admin bootstrap endpoint removed after initial Super Admin creation.
 
+
+  // Password recovery requests are reviewed by an authenticated admin. Never disclose stored passwords.
+  if (method === "POST" && path === "/api/password-recovery") {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS password_recovery_requests (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), lookup_value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id), admin_note TEXT NOT NULL DEFAULT '')`).run();
+    const d = await body(request), lookup = String(d.accountNumber || d.username || '').trim();
+    if (lookup.length < 3 || lookup.length > 80) return response({error:'Enter your account number or username.'},400,request);
+    const customer = await env.DB.prepare(`SELECT u.id,u.username,a.account_number FROM users u LEFT JOIN accounts a ON a.user_id=u.id WHERE u.role!='admin' AND (lower(u.username)=lower(?) OR upper(a.account_number)=upper(?)) LIMIT 1`).bind(lookup,lookup).first();
+    // Return a generic response to reduce account enumeration.
+    if (customer) {
+      const existing = await env.DB.prepare("SELECT id FROM password_recovery_requests WHERE user_id=? AND status='pending' LIMIT 1").bind(customer.id).first();
+      if (!existing) { const rid=uid(); await env.DB.prepare("INSERT INTO password_recovery_requests(id,user_id,lookup_value) VALUES(?,?,?)").bind(rid,customer.id,lookup).run(); await audit(env,{id:customer.id},"password_recovery_requested","user",customer.id,{requestId:rid}); }
+    }
+    return response({ok:true,message:'If the details match a demo account, a recovery request has been sent for admin review.'},202,request);
+  }
+
   if (method === "POST" && path === "/api/register") {
     const d = await body(request);
     const username = String(d.username || "").trim().toLowerCase(), displayName = String(d.displayName || "").trim();
@@ -194,7 +209,7 @@ async function route(request, env) {
   if (method === "POST" && path === "/api/login") {
     const d = await body(request), login = String(d.login || "").trim().toLowerCase();
     const user = await env.DB.prepare("SELECT * FROM users WHERE username=? OR email=?").bind(login, login).first();
-    if (!user || user.status !== "active" || (await passwordHash(String(d.password || ""), user.password_salt)) !== user.password_hash)
+    if (!user || user.status !== "active" || (d.loginMode === "admin" ? user.role !== "admin" : user.role === "admin") || (await passwordHash(String(d.password || ""), user.password_salt)) !== user.password_hash)
       return response({ error: "Invalid login or password." }, 401, request);
     const token = b64(crypto.getRandomValues(new Uint8Array(32)));
     const expires = new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString();
@@ -204,6 +219,30 @@ async function route(request, env) {
   }
 
   const user = await auth(request, env);
+
+  if (path.startsWith('/api/admin/password-recovery')) {
+    if (user.role !== 'admin') return response({error:'Admin permission required.'},403,request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS password_recovery_requests (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), lookup_value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id), admin_note TEXT NOT NULL DEFAULT '')`).run();
+    if (method === 'GET' && path === '/api/admin/password-recovery') {
+      const rows=await env.DB.prepare(`SELECT r.id,r.lookup_value,r.status,r.created_at,r.admin_note,u.username,u.display_name,u.email,a.account_number FROM password_recovery_requests r JOIN users u ON u.id=r.user_id LEFT JOIN accounts a ON a.user_id=u.id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 200`).all();
+      return response({requests:rows.results||[]},200,request);
+    }
+    const match=path.match(/^\/api\/admin\/password-recovery\/([^/]+)\/(reset|reject)$/);
+    if (method === 'POST' && match) {
+      const req=await env.DB.prepare("SELECT * FROM password_recovery_requests WHERE id=? AND status='pending'").bind(match[1]).first();
+      if(!req) return response({error:'Pending recovery request not found.'},404,request);
+      const d=await body(request);
+      if(match[2]==='reject') { await env.DB.prepare("UPDATE password_recovery_requests SET status='rejected',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind(String(d.note||'Rejected by admin').slice(0,250),user.id,req.id).run(); await audit(env,user,'password_recovery_rejected','password_recovery_request',req.id); return response({ok:true,message:'Recovery request rejected.'},200,request); }
+      const password=String(d.temporaryPassword||'');
+      if(password.length<10 || password.length>128) return response({error:'Temporary password must be 10–128 characters.'},400,request);
+      const salt=uid(), hash=await passwordHash(password,salt);
+      await env.DB.batch([env.DB.prepare("UPDATE users SET password_hash=?,password_salt=? WHERE id=? AND role!='admin'").bind(hash,salt,req.user_id),env.DB.prepare("UPDATE password_recovery_requests SET status='approved',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind('Password reset by admin. Customer must sign in with the temporary password and change it.',user.id,req.id)]);
+      await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(req.user_id).run();
+      await audit(env,user,'password_reset_by_admin','user',req.user_id,{requestId:req.id});
+      return response({ok:true,message:'Password reset complete. Share the temporary password securely with the customer.'},200,request);
+    }
+  }
+
   if (method === "POST" && path === "/api/logout") {
     const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
     if (token) await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await digest(token)).run();
