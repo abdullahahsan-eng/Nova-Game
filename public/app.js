@@ -184,3 +184,20 @@ document.querySelectorAll(".quick-nav [data-view]").forEach(a=>a.addEventListene
 (async()=>{if(token){try{await loadDashboard();const initial=(location.hash||"#overview").slice(1);window.novaNavigate(({transactionsPanel:"transactions",cardsLoansPanel:"cards",transferForm:"transfer",applicationsPanel:"requests",accountInfoTitle:"account"})[initial]||initial)}catch(e){token="";localStorage.removeItem("novabank_token");setAuth(true);notice(e.message,true)}}else setAuth(true)})();
 
 const accountClosureBtn=$("#requestAccountClosure");accountClosureBtn?.addEventListener("click",()=>notice("Account closure request UI is ready, but this action needs a matching backend endpoint before it can be submitted. Contact the Super Admin for now.",true));
+
+
+// Landing-page controls: keep login and account-opening forms off the homepage until requested.
+(function landingPageControls(){
+ const panel=document.querySelector('#authPanel'), login=document.querySelector('#loginCard'), register=document.querySelector('#registerCard');
+ function showAuth(which){if(!panel)return;panel.classList.remove('hidden');login?.classList.toggle('hidden',which!=='login');register?.classList.toggle('hidden',which!=='register');const mode=document.querySelector('#loginMode');if(mode)mode.value=which==='admin'?'admin':'customer';const heading=login?.querySelector('h2');if(heading)heading.textContent=which==='admin'?'Admin Login':'Customer Login';panel.scrollIntoView({behavior:'smooth',block:'start'});}
+ document.querySelector('#customerLoginLink')?.addEventListener('click',e=>{e.preventDefault();showAuth('login')});
+ document.querySelector('#adminLoginLink')?.addEventListener('click',e=>{e.preventDefault();showAuth('admin')});
+ document.querySelector('#heroOpenAccount')?.addEventListener('click',()=>showAuth('register'));
+ document.querySelector('#heroExploreOffers')?.addEventListener('click',()=>document.querySelector('#promoCarousel')?.scrollIntoView({behavior:'smooth',block:'center'}));
+ document.querySelectorAll('[data-promo-action="login"]').forEach(b=>b.addEventListener('click',()=>showAuth('login')));
+ const slides=[...document.querySelectorAll('.promo-slide')],dots=[...document.querySelectorAll('.promo-dot')];let active=0,timer;
+ function go(i){if(!slides.length)return;active=(i+slides.length)%slides.length;slides.forEach((s,n)=>s.classList.toggle('active',n===active));dots.forEach((d,n)=>d.classList.toggle('active',n===active));}
+ function restart(){clearInterval(timer);if(!matchMedia('(prefers-reduced-motion: reduce)').matches)timer=setInterval(()=>go(active+1),5200)}
+ dots.forEach((d,i)=>d.addEventListener('click',()=>{go(i);restart()}));document.querySelector('#promoPrev')?.addEventListener('click',()=>{go(active-1);restart()});document.querySelector('#promoNext')?.addEventListener('click',()=>{go(active+1);restart()});
+ go(0);restart();document.querySelector('#promoCarousel')?.addEventListener('mouseenter',()=>clearInterval(timer));document.querySelector('#promoCarousel')?.addEventListener('mouseleave',restart);
+})();
