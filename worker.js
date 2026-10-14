@@ -167,6 +167,42 @@ async function route(request, env) {
   if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
   if (method === "GET" && path === "/api/health") return response({ ok: true, app: "NovaBank", mode: "fictional-simulator" }, 200, request);
 
+  // TEMPORARY ADMIN PASSWORD RECOVERY
+  if (method === "POST" && path === "/api/admin-password-reset") {
+    const data = await body(request);
+
+    if (!env.ADMIN_RESET_KEY ||
+        data.resetKey !== env.ADMIN_RESET_KEY) {
+      return response({ error: "Invalid recovery key" }, 403, request);
+    }
+
+    const username = String(data.username || "").trim().toLowerCase();
+    const newPassword = String(data.newPassword || "");
+
+    if (username !== "novabankadmin" || newPassword.length < 12) {
+      return response({
+        error: "Use the existing admin username and a password of at least 12 characters."
+      }, 400, request);
+    }
+
+    const admin = await env.DB.prepare(
+      "SELECT id FROM users WHERE lower(username)=? AND role='admin' LIMIT 1"
+    ).bind(username).first();
+
+    if (!admin) {
+      return response({ error: "Existing admin not found" }, 404, request);
+    }
+
+    const salt = uid();
+    const hash = await passwordHash(newPassword, salt);
+
+    await env.DB.prepare(
+      "UPDATE users SET password_hash=?, password_salt=? WHERE id=? AND role='admin'"
+    ).bind(hash, salt, admin.id).run();
+
+    return response({ ok: true, message: "Admin password updated." }, 200, request);
+  }
+
   // Admin bootstrap endpoint removed after initial Super Admin creation.
 
 
