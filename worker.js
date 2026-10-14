@@ -1074,6 +1074,17 @@ async function route(request, env) {
       await audit(env,user,`${r.product_type}_closure_${status}`,r.product_type,r.product_id,{requestId:r.id,note});
       return response({ok:true,message:`Closure request ${status}.`},200,request);
     }
+    const offerArchiveMatch = path.match(/^\/api\/admin\/offers\/([^/]+)\/archive$/);
+    if (offerArchiveMatch && method === "POST") {
+      await ensureColumn(env, "offers", "deleted_at", "TEXT");
+      const offer = await env.DB.prepare("SELECT id,title FROM offers WHERE id=? AND deleted_at IS NULL").bind(offerArchiveMatch[1]).first();
+      if (!offer) return response({error:"Offer was already removed or was not found."},404,request);
+      const changed = await env.DB.prepare("UPDATE offers SET deleted_at=datetime('now'),active=0,updated_at=datetime('now') WHERE id=? AND deleted_at IS NULL").bind(offer.id).run();
+      if (!Number(changed.meta?.changes||0)) return response({error:"Offer changed while removing. Refresh and retry."},409,request);
+      await audit(env,user,"offer_archived","offer",offer.id,{title:offer.title,note:String(d.note||"Removed by Super Admin").slice(0,250)});
+      return response({ok:true,message:"Offer removed from customer portals. Record and audit history are preserved."},200,request);
+    }
+
     const assignOfferMatch = path.match(/^\/api\/admin\/offers\/([^/]+)\/assign$/);
     if (assignOfferMatch) {
       const targetUser = String(d.userId || "").trim();
