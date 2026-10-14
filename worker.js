@@ -21,19 +21,62 @@ function corsHeaders(request) {
 async function body(request) {
   try { return await request.json(); } catch { return {}; }
 }
+const STAFF_ROLES = new Set(['branch_manager','loan_officer','credit_officer','cashier','auditor']);
+async function ensureSecurityTables(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
+  await env.DB.prepare("INSERT OR IGNORE INTO branches(id,name,status) VALUES('NB-HQ','NovaBank Head Office','active')").run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS staff_roles (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, role_name TEXT NOT NULL CHECK(role_name IN ('branch_manager','loan_officer','credit_officer','cashier','auditor')), branch_id TEXT REFERENCES branches(id), is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')), created_by TEXT REFERENCES users(id))`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS auth_rate_limits (rate_key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
+  await ensureColumn(env, 'accounts', 'branch_id', "TEXT NOT NULL DEFAULT 'NB-HQ'");
+  await ensureColumn(env, 'users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
+  await env.DB.prepare("UPDATE accounts SET branch_id='NB-HQ' WHERE branch_id IS NULL OR branch_id='' ").run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_accounts_branch ON accounts(branch_id)').run();
+}
+function isSuperAdmin(user) { return !!user && user.role === 'admin'; }
+function staffRole(user) { return user?.role || 'customer'; }
+function hasStaffPermission(user, method, path) {
+  if (!user || isSuperAdmin(user)) return isSuperAdmin(user);
+  const r = staffRole(user), m = method.toUpperCase();
+  const match = (re, methods) => methods.includes(m) && re.test(path);
+  if (r === 'branch_manager') return (
+    match(/^\/api\/admin\/customers$/, ['GET']) || match(/^\/api\/admin\/customer-details$/, ['GET']) ||
+    match(/^\/api\/admin\/accounts\/[^/]+\/status$/, ['POST']) || match(/^\/api\/admin\/money-requests$/, ['GET']) ||
+    match(/^\/api\/admin\/money-requests\/[^/]+\/(review|archive)$/, ['POST']) ||
+    match(/^\/api\/account-closure-requests$/, ['GET']) || match(/^\/api\/admin\/account-closure-requests\/[^/]+\/review$/, ['POST'])
+  );
+  if (r === 'loan_officer') return match(/^\/api\/loans$/, ['GET']) || match(/^\/api\/admin\/loans\/[^/]+\/review$/, ['POST']);
+  if (r === 'credit_officer') return match(/^\/api\/cards$/, ['GET']) || match(/^\/api\/admin\/cards\/[^/]+\/review$/, ['POST']) || match(/^\/api\/admin\/card-control-requests$/, ['GET']) || match(/^\/api\/admin\/card-control-requests\/[^/]+\/review$/, ['POST']);
+  if (r === 'cashier') return match(/^\/api\/admin\/money-requests$/, ['GET']) || match(/^\/api\/admin\/money-requests\/[^/]+\/(review|archive)$/, ['POST']);
+  if (r === 'auditor') return match(/^\/api\/transactions$/, ['GET']) || match(/^\/api\/admin\/audit$/, ['GET']) || match(/^\/api\/admin\/summary$/, ['GET']);
+  return false;
+}
+async function rateLimit(env, key, maxAttempts=8, windowSeconds=900) {
+  const now = Math.floor(Date.now()/1000), start = now - (now % windowSeconds);
+  await env.DB.prepare(`INSERT INTO auth_rate_limits(rate_key,window_start,attempts) VALUES(?,?,1) ON CONFLICT(rate_key) DO UPDATE SET attempts=CASE WHEN auth_rate_limits.window_start=excluded.window_start THEN auth_rate_limits.attempts+1 ELSE 1 END,window_start=excluded.window_start,updated_at=datetime('now')`).bind(key,start).run();
+  const row = await env.DB.prepare('SELECT attempts,window_start FROM auth_rate_limits WHERE rate_key=?').bind(key).first();
+  return { allowed: Number(row?.attempts||0) <= maxAttempts, attempts: Number(row?.attempts||0), retryAfter: Math.max(1, Number(row?.window_start||start)+windowSeconds-now) };
+}
+async function clearRateLimit(env, key) { await env.DB.prepare('DELETE FROM auth_rate_limits WHERE rate_key=?').bind(key).run(); }
+async function auditSecurityFailure(env, action, target, details={}) {
+  try { await audit(env, null, action, 'authentication', target || null, details); } catch (_) {}
+}
 async function auth(request, env) {
   const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
   if (!token) return null;
   const tokenHash = await digest(token);
   const row = await env.DB.prepare(
-    `SELECT u.id,u.username,u.display_name,u.email,u.role,u.status,s.expires_at
-     FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`
+    `SELECT u.id,u.username,u.display_name,u.email,COALESCE(sr.role_name,u.role) AS role,u.role AS base_role,u.status,u.must_change_password,s.expires_at,s.created_at AS session_created_at,sr.branch_id AS staff_branch_id,sr.is_active AS staff_active
+     FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN staff_roles sr ON sr.user_id=u.id WHERE s.token_hash=?`
   ).bind(tokenHash).first();
-  if (!row || new Date(row.expires_at).getTime() < Date.now() || row.status !== "active") return null;
+  if (!row) return null;
+  if (new Date(row.expires_at).getTime() < Date.now() || Date.now()-new Date(row.session_created_at).getTime() > 8*60*60*1000 || row.status !== "active" || (row.base_role === 'admin' && row.role !== 'admin' && Number(row.staff_active)!==1)) {
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(tokenHash).run().catch(()=>{});
+    return null;
+  }
   return row;
 }
 function response(data, status, request) {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...corsHeaders(request) } });
+  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options":"nosniff", "referrer-policy":"no-referrer", "x-frame-options":"DENY", ...corsHeaders(request) } });
 }
 async function audit(env, actor, action, targetType, targetId, details = {}) {
   await env.DB.prepare("INSERT INTO audit_events(id,actor_user_id,action,target_type,target_id,details) VALUES(?,?,?,?,?,?)")
@@ -166,9 +209,13 @@ async function route(request, env) {
   if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
   if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
   if (method === "GET" && path === "/api/health") return response({ ok: true, app: "NovaBank", mode: "fictional-simulator" }, 200, request);
+  await ensureSecurityTables(env);
 
   // TEMPORARY ADMIN PASSWORD RECOVERY
   if (method === "POST" && path === "/api/admin-password-reset") {
+    const resetRateKey = await digest(`reset:${request.headers.get('CF-Connecting-IP')||'unknown'}`);
+    const resetLimit = await rateLimit(env, resetRateKey, 5, 900);
+    if (!resetLimit.allowed) return response({error:'Too many password reset attempts. Try again later.'},429,request);
     const data = await body(request);
 
     if (!env.ADMIN_RESET_KEY ||
@@ -197,10 +244,12 @@ async function route(request, env) {
     const hash = await passwordHash(newPassword, salt);
 
     await env.DB.prepare(
-      "UPDATE users SET password_hash=?, password_salt=? WHERE id=? AND role='admin'"
+      "UPDATE users SET password_hash=?, password_salt=?, must_change_password=1 WHERE id=? AND role='admin'"
     ).bind(hash, salt, admin.id).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(admin.id).run();
+    await audit(env,{id:admin.id},'admin_password_reset','user',admin.id,{method:'recovery_key'});
 
-    return response({ ok: true, message: "Admin password updated." }, 200, request);
+    return response({ ok: true, message: "Admin password updated. Sign in again and choose a new password." }, 200, request);
   }
 
   // Admin bootstrap endpoint removed after initial Super Admin creation.
@@ -208,6 +257,7 @@ async function route(request, env) {
 
   // Password recovery requests are reviewed by an authenticated admin. Never disclose stored passwords.
   if (method === "POST" && path === "/api/password-recovery") {
+    const recoveryKey=await digest(`recovery:${request.headers.get('CF-Connecting-IP')||'unknown'}`); const recoveryLimit=await rateLimit(env,recoveryKey,5,3600); if(!recoveryLimit.allowed) return response({error:'Too many recovery requests. Try again later.'},429,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS password_recovery_requests (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), lookup_value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id), admin_note TEXT NOT NULL DEFAULT '')`).run();
     const d = await body(request), lookup = String(d.accountNumber || d.username || '').trim();
     if (lookup.length < 3 || lookup.length > 80) return response({error:'Enter your account number or username.'},400,request);
@@ -244,20 +294,112 @@ async function route(request, env) {
 
   if (method === "POST" && path === "/api/login") {
     const d = await body(request), login = String(d.login || "").trim().toLowerCase();
-    const user = await env.DB.prepare("SELECT * FROM users WHERE username=? OR email=?").bind(login, login).first();
-    if (!user || user.status !== "active" || (d.loginMode === "admin" ? user.role !== "admin" : user.role === "admin") || (await passwordHash(String(d.password || ""), user.password_salt)) !== user.password_hash)
+    if (!login || login.length > 120 || String(d.password||'').length > 256) return response({error:'Invalid login or password.'},400,request);
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const rateKey = await digest(`login:${ip}:${login}`);
+    const limited = await rateLimit(env, rateKey, 8, 900);
+    const ipLimited = await rateLimit(env, await digest(`login-ip:${ip}`), 30, 900);
+    if (!limited.allowed || !ipLimited.allowed) return response({error:'Too many login attempts. Try again in 15 minutes.'},429,request);
+    const user = await env.DB.prepare("SELECT u.*,sr.role_name AS assigned_staff_role,sr.is_active AS staff_active,sr.branch_id AS staff_branch_id FROM users u LEFT JOIN staff_roles sr ON sr.user_id=u.id WHERE u.username=? OR u.email=?").bind(login, login).first();
+    const effectiveRole = user?.assigned_staff_role || user?.role;
+    const isStaffLogin = d.loginMode === 'admin';
+    const staffAssignmentValid = !user?.assigned_staff_role || Number(user.staff_active) === 1;
+    const roleAllowed = isStaffLogin ? (effectiveRole !== 'customer' && (effectiveRole === 'admin' || STAFF_ROLES.has(effectiveRole))) : effectiveRole === 'customer';
+    const valid = !!user && user.status === 'active' && staffAssignmentValid && roleAllowed && (await passwordHash(String(d.password || ""), user.password_salt)) === user.password_hash;
+    if (!valid) {
+      await auditSecurityFailure(env,'login_failed',user?.id||login.slice(0,80),{loginMode:isStaffLogin?'staff':'customer',ipHash:await digest(ip),reason:'invalid_credentials_or_role'});
       return response({ error: "Invalid login or password." }, 401, request);
+    }
+    await clearRateLimit(env, rateKey);
+    await clearRateLimit(env, await digest(`login-ip:${ip}`));
     const token = b64(crypto.getRandomValues(new Uint8Array(32)));
-    const expires = new Date(Date.now() + 1000 * 60 * 60 * 24).toISOString();
+    const expires = new Date(Date.now() + 1000 * 60 * 60 * 8).toISOString();
+    await env.DB.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run();
     await env.DB.prepare("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)").bind(await digest(token), user.id, expires).run();
-    await audit(env, user, "login", "user", user.id);
-    return response({ token, user: { id:user.id, username:user.username, displayName:user.display_name, email:user.email, role:user.role } }, 200, request);
+    await audit(env, user, "login", "user", user.id, {role:effectiveRole});
+    return response({ token, expiresAt:expires, user: { id:user.id, username:user.username, displayName:user.display_name, email:user.email, role:effectiveRole, branchId:user.staff_branch_id||null, mustChangePassword:Number(user.must_change_password||0)===1 } }, 200, request);
   }
 
   const user = await auth(request, env);
 
+  // Staff directory and role assignments are Super Admin-only.
+  if (path === '/api/admin/staff' && method === 'GET') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const rows = await env.DB.prepare(`SELECT u.id,u.username,u.display_name,u.email,u.status,sr.role_name,sr.branch_id,sr.is_active,sr.created_at FROM staff_roles sr JOIN users u ON u.id=sr.user_id ORDER BY sr.created_at DESC`).all();
+    const branches = await env.DB.prepare("SELECT id,name,status FROM branches ORDER BY name").all();
+    return response({staff:rows.results||[],branches:branches.results||[]},200,request);
+  }
+  if (path === '/api/admin/branches' && method === 'GET') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const rows=await env.DB.prepare("SELECT id,name,status FROM branches ORDER BY name").all();
+    return response({branches:rows.results||[]},200,request);
+  }
+  const accountBranchMatch=path.match(/^\/api\/admin\/accounts\/([^/]+)\/branch$/);
+  if (accountBranchMatch && method==='POST') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const d=await body(request), branchId=String(d.branchId||'');
+    const branch=await env.DB.prepare("SELECT id,name FROM branches WHERE id=? AND status='active'").bind(branchId).first();
+    if(!branch) return response({error:'Select an active branch.'},400,request);
+    const account=await env.DB.prepare("SELECT id,account_number,branch_id FROM accounts WHERE id=?").bind(accountBranchMatch[1]).first();
+    if(!account) return response({error:'Account not found.'},404,request);
+    const oldBranch=account.branch_id||'NB-HQ';
+    await env.DB.prepare("UPDATE accounts SET branch_id=? WHERE id=?").bind(branchId,account.id).run();
+    await audit(env,user,'account_branch_changed','account',account.id,{accountNumber:account.account_number,fromBranch:oldBranch,toBranch:branchId});
+    return response({ok:true,message:`Account assigned to ${branch.name}.`},200,request);
+  }
+  if (path === '/api/admin/branches' && method === 'POST') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const d=await body(request), name=String(d.name||'').trim().slice(0,80), id=String(d.id||'').trim().toUpperCase();
+    if (!/^[A-Z0-9-]{2,24}$/.test(id) || name.length<2) return response({error:'Enter a branch ID (2–24 letters/numbers/hyphens) and name.'},400,request);
+    try { await env.DB.prepare("INSERT INTO branches(id,name,status) VALUES(?,?,'active')").bind(id,name).run(); await audit(env,user,'branch_created','branch',id,{name}); return response({ok:true},201,request); }
+    catch (_) { return response({error:'Branch ID or name already exists.'},409,request); }
+  }
+  if (path === '/api/admin/staff' && method === 'POST') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const d=await body(request), username=String(d.username||'').trim().toLowerCase(), displayName=String(d.displayName||'').trim(), email=String(d.email||'').trim().toLowerCase(), password=String(d.password||''), role=String(d.role||''), branchId=String(d.branchId||'NB-HQ');
+    if (!/^[a-z0-9_]{3,24}$/.test(username) || displayName.length<2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length<12 || password.length>128 || !STAFF_ROLES.has(role)) return response({error:'Enter valid staff details, a permitted role, and a password of 12–128 characters.'},400,request);
+    const branch=await env.DB.prepare("SELECT id FROM branches WHERE id=? AND status='active'").bind(branchId).first();
+    if (!branch) return response({error:'Select an active branch.'},400,request);
+    const id=uid(), salt=uid(), hash=await passwordHash(password,salt);
+    try {
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO users(id,username,display_name,email,password_hash,password_salt,role,status) VALUES(?,?,?,?,?,?,'admin','active')").bind(id,username,displayName,email,hash,salt),
+        env.DB.prepare("INSERT INTO staff_roles(user_id,role_name,branch_id,is_active,created_by) VALUES(?,?,?,1,?)").bind(id,role,role==='branch_manager'?branchId:null,user.id)
+      ]);
+      await audit(env,user,'staff_created','staff_user',id,{username,role,branchId:role==='branch_manager'?branchId:null});
+      return response({ok:true,message:'Staff account created. Share the initial password securely.'},201,request);
+    } catch (_) { return response({error:'Username or email already exists; no staff account was created.'},409,request); }
+  }
+  const staffResetMatch=path.match(/^\/api\/admin\/staff\/([^/]+)\/reset-password$/);
+  if (staffResetMatch && method==='POST') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const d=await body(request), password=String(d.temporaryPassword||'');
+    if(password.length<12||password.length>128) return response({error:'Temporary password must be 12–128 characters.'},400,request);
+    const staff=await env.DB.prepare("SELECT u.id,u.username FROM users u JOIN staff_roles sr ON sr.user_id=u.id WHERE u.id=?").bind(staffResetMatch[1]).first();
+    if(!staff) return response({error:'Staff account not found.'},404,request);
+    const salt=uid(),hash=await passwordHash(password,salt);
+    await env.DB.prepare("UPDATE users SET password_hash=?,password_salt=?,must_change_password=1 WHERE id=?").bind(hash,salt,staff.id).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(staff.id).run();
+    await audit(env,user,'staff_password_reset','staff_user',staff.id,{username:staff.username,mustChangePassword:true});
+    return response({ok:true,message:'Temporary password set. All existing staff sessions were revoked; the user must change it at next login.'},200,request);
+  }
+  const staffMatch=path.match(/^\/api\/admin\/staff\/([^/]+)$/);
+  if (staffMatch && method==='PATCH') {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    const d=await body(request), target=await env.DB.prepare("SELECT sr.*,u.username FROM staff_roles sr JOIN users u ON u.id=sr.user_id WHERE sr.user_id=?").bind(staffMatch[1]).first();
+    if (!target) return response({error:'Staff account not found.'},404,request);
+    const role=String(d.role||target.role_name), active=d.active===undefined?Number(target.is_active): (d.active?1:0), branchId=String(d.branchId||target.branch_id||'NB-HQ');
+    if (!STAFF_ROLES.has(role)) return response({error:'Invalid staff role.'},400,request);
+    const branch=await env.DB.prepare("SELECT id FROM branches WHERE id=? AND status='active'").bind(branchId).first();
+    if (role==='branch_manager'&&!branch) return response({error:'Select an active branch.'},400,request);
+    await env.DB.prepare("UPDATE staff_roles SET role_name=?,branch_id=?,is_active=?,updated_at=datetime('now') WHERE user_id=?").bind(role,role==='branch_manager'?branchId:null,active,staffMatch[1]).run();
+    if (!active) await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(staffMatch[1]).run();
+    await audit(env,user,active?'staff_role_updated':'staff_access_revoked','staff_user',staffMatch[1],{role,active,branchId:role==='branch_manager'?branchId:null});
+    return response({ok:true,message:active?'Staff permissions updated.':'Staff access disabled and sessions revoked.'},200,request);
+  }
+
   if (path.startsWith('/api/admin/password-recovery')) {
-    if (user.role !== 'admin') return response({error:'Admin permission required.'},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:'Insufficient role permission.'},403,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS password_recovery_requests (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), lookup_value TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT, reviewed_by TEXT REFERENCES users(id), admin_note TEXT NOT NULL DEFAULT '')`).run();
     if (method === 'GET' && path === '/api/admin/password-recovery') {
       const rows=await env.DB.prepare(`SELECT r.id,r.lookup_value,r.status,r.created_at,r.admin_note,u.username,u.display_name,u.email,a.account_number FROM password_recovery_requests r JOIN users u ON u.id=r.user_id LEFT JOIN accounts a ON a.user_id=u.id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 200`).all();
@@ -272,7 +414,7 @@ async function route(request, env) {
       const password=String(d.temporaryPassword||'');
       if(password.length<10 || password.length>128) return response({error:'Temporary password must be 10–128 characters.'},400,request);
       const salt=uid(), hash=await passwordHash(password,salt);
-      await env.DB.batch([env.DB.prepare("UPDATE users SET password_hash=?,password_salt=? WHERE id=? AND role!='admin'").bind(hash,salt,req.user_id),env.DB.prepare("UPDATE password_recovery_requests SET status='approved',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind('Password reset by admin. Customer must sign in with the temporary password and change it.',user.id,req.id)]);
+      await env.DB.batch([env.DB.prepare("UPDATE users SET password_hash=?,password_salt=?,must_change_password=1 WHERE id=? AND role!='admin'").bind(hash,salt,req.user_id),env.DB.prepare("UPDATE password_recovery_requests SET status='approved',admin_note=?,reviewed_at=datetime('now'),reviewed_by=? WHERE id=? AND status='pending'").bind('Password reset by admin. Customer must sign in with the temporary password and change it.',user.id,req.id)]);
       await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(req.user_id).run();
       await audit(env,user,'password_reset_by_admin','user',req.user_id,{requestId:req.id});
       return response({ok:true,message:'Password reset complete. Share the temporary password securely with the customer.'},200,request);
@@ -285,6 +427,27 @@ async function route(request, env) {
     return response({ ok: true }, 200, request);
   }
   if (!user) return response({ error: "Please log in." }, 401, request);
+  if (method==='POST' && path==='/api/change-password') {
+    const d=await body(request), currentPassword=String(d.currentPassword||''), newPassword=String(d.newPassword||'');
+    if(newPassword.length<12||newPassword.length>128) return response({error:'New password must be 12–128 characters.'},400,request);
+    const current=await env.DB.prepare("SELECT password_hash,password_salt FROM users WHERE id=?").bind(user.id).first();
+    if(!current || (await passwordHash(currentPassword,current.password_salt))!==current.password_hash) return response({error:'Current password is incorrect.'},403,request);
+    if(currentPassword===newPassword) return response({error:'Choose a different password.'},400,request);
+    const salt=uid(),hash=await passwordHash(newPassword,salt),token=(request.headers.get('Authorization')||'').replace(/^Bearer\s+/i,'');
+    const currentTokenHash=await digest(token),expires=new Date(Date.now()+8*60*60*1000).toISOString();
+    await env.DB.prepare("UPDATE users SET password_hash=?,password_salt=?,must_change_password=0 WHERE id=?").bind(hash,salt,user.id).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id=? AND token_hash<>?").bind(user.id,currentTokenHash).run();
+    await env.DB.prepare("UPDATE sessions SET expires_at=? WHERE token_hash=?").bind(expires,currentTokenHash).run();
+    await audit(env,user,'password_changed','user',user.id,{forcedChange:Number(user.must_change_password||0)===1});
+    return response({ok:true,message:'Password changed. Other sessions have been signed out.'},200,request);
+  }
+  if (Number(user.must_change_password||0)===1 && !['/api/me','/api/change-password','/api/logout'].includes(path)) return response({error:'For security, change your temporary password before continuing.'},403,request);
+  if (STAFF_ROLES.has(staffRole(user)) && method==='POST' && (
+    path==='/api/transfer' || path==='/api/loans' || path==='/api/cards' || path==='/api/card-bill/pay' ||
+    path==='/api/account-closure-requests' || path==='/api/password-recovery' ||
+    /^\/api\/cards\/[^/]+\/(purchase|repay|activate|control-request)$/.test(path) ||
+    /^\/api\/loans\/[^/]+\/(accept|repay|closure-request)$/.test(path) || /^\/api\/cards\/[^/]+\/closure-request$/.test(path)
+  )) return response({error:'Staff accounts cannot perform customer banking actions.'},403,request);
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS product_closure_requests (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), product_type TEXT NOT NULL CHECK(product_type IN ('loan','card')),
     product_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
@@ -296,7 +459,7 @@ async function route(request, env) {
   await ensureColumn(env, "loan_applications", "deleted_at", "TEXT").catch(()=>{});
   await ensureColumn(env, "card_applications", "deleted_at", "TEXT").catch(()=>{});
   if (method === "GET" && path === "/api/closure-requests") {
-    const rows = user.role === "admin"
+    const rows = isSuperAdmin(user)
       ? await env.DB.prepare(`SELECT r.*,u.display_name,u.username FROM product_closure_requests r JOIN users u ON u.id=r.user_id WHERE r.deleted_at IS NULL ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all()
       : await env.DB.prepare("SELECT * FROM product_closure_requests WHERE user_id=? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
     return response({requests:rows.results||[]},200,request);
@@ -340,7 +503,7 @@ async function route(request, env) {
 
   // Super Admin: list customers and their demo accounts.
   if (method === "GET" && path === "/api/admin/summary") {
-    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
       type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
@@ -372,23 +535,28 @@ async function route(request, env) {
   }
 
   if (method === "GET" && path === "/api/admin/customers") {
-    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    if (!hasStaffPermission(user, method, path)) return response({ error: "Insufficient role permission." }, 403, request);
     const q = String(url.searchParams.get("q") || "").trim().slice(0,100);
     const like = `%${q.replace(/[\%_]/g, "\\$&")}%`;
-    const rows = await env.DB.prepare(`SELECT u.id AS user_id,u.username,u.display_name,u.email,u.role AS user_role,u.status AS user_status,u.created_at AS customer_since,
+    const branchScoped = staffRole(user)==='branch_manager';
+    const sql = `SELECT u.id AS user_id,u.username,u.display_name,u.email,u.role AS user_role,u.status AS user_status,u.created_at AS customer_since,
       a.id AS account_id,a.account_number,a.account_type,a.status AS account_status,a.balance,a.opened_at
       FROM users u LEFT JOIN accounts a ON a.user_id=u.id
-      WHERE u.role!='admin' AND (?='' OR u.username LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\' OR a.account_number LIKE ? ESCAPE '\\')
-      ORDER BY u.created_at DESC LIMIT 250`).bind(q,like,like,like,like).all();
+      WHERE u.role!='admin' AND (?='' OR u.username LIKE ? ESCAPE '\\' OR u.display_name LIKE ? ESCAPE '\\' OR u.email LIKE ? ESCAPE '\\' OR a.account_number LIKE ? ESCAPE '\\')` + (branchScoped ? ` AND a.branch_id=?` : ``) + ` ORDER BY u.created_at DESC LIMIT 250`;
+    const rows = branchScoped ? await env.DB.prepare(sql).bind(q,like,like,like,like,user.staff_branch_id||'NB-HQ').all() : await env.DB.prepare(sql).bind(q,like,like,like,like).all();
     return response({ customers: rows.results || [] }, 200, request);
   }
 
   if (method === "GET" && path === "/api/admin/customer-details") {
-    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    if (!hasStaffPermission(user, method, path)) return response({ error: "Insufficient role permission." }, 403, request);
     const customerId = String(url.searchParams.get("userId") || "").trim();
     if (!customerId) return response({ error: "Customer ID is required." }, 400, request);
     const customer = await env.DB.prepare("SELECT id,username,display_name,email,role,status,created_at FROM users WHERE id=? AND role!='admin'").bind(customerId).first();
     if (!customer) return response({ error: "Customer not found." }, 404, request);
+    if (staffRole(user)==='branch_manager') {
+      const scope=await env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN branch_id=? THEN 1 ELSE 0 END) AS in_branch FROM accounts WHERE user_id=?").bind(user.staff_branch_id||'NB-HQ',customerId).first();
+      if (!Number(scope?.in_branch||0) || Number(scope?.total||0)!==Number(scope?.in_branch||0)) return response({error:'Customer is outside your assigned branch scope.'},403,request);
+    }
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
       id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
       user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -415,11 +583,12 @@ async function route(request, env) {
 
   const accountStatusMatch = path.match(/^\/api\/admin\/accounts\/([^/]+)\/status$/);
   if (accountStatusMatch && method === "POST") {
-    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    if (!hasStaffPermission(user, method, path)) return response({ error: "Insufficient role permission." }, 403, request);
     const d = await body(request), status = String(d.status || "");
     if (!['active','frozen'].includes(status)) return response({ error: "Choose active or frozen." }, 400, request);
     const account = await env.DB.prepare("SELECT a.*,u.id AS owner_id,u.display_name,u.username FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.id=?").bind(accountStatusMatch[1]).first();
     if (!account) return response({ error: "Account not found." }, 404, request);
+    if (staffRole(user)==='branch_manager' && account.branch_id !== (user.staff_branch_id||'NB-HQ')) return response({error:'Account is outside your assigned branch scope.'},403,request);
     if (account.status === status) return response({ ok:true, status, message:`Account is already ${status}.` }, 200, request);
     const note = String(d.note || "").trim().slice(0,250);
     await env.DB.prepare("UPDATE accounts SET status=? WHERE id=?").bind(status, account.id).run();
@@ -454,7 +623,7 @@ async function route(request, env) {
       ];
       await env.DB.batch(seeds.map(x => env.DB.prepare("INSERT INTO offers(id,title,category,description,benefit,cta_label,active,valid_until) VALUES(?,?,?,?,?,?,?,?)").bind(...x)));
     }
-    const rows = user.role === "admin"
+    const rows = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT * FROM offers WHERE deleted_at IS NULL ORDER BY created_at DESC").all()
       : await env.DB.prepare("SELECT o.* FROM offers o WHERE o.deleted_at IS NULL AND o.active=1 AND (o.valid_until='' OR o.valid_until>=date('now')) AND (NOT EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id) OR EXISTS(SELECT 1 FROM offer_assignments oa WHERE oa.offer_id=o.id AND oa.user_id=?)) ORDER BY o.created_at DESC").bind(user.id).all();
     return response({ offers: rows.results || [] }, 200, request);
@@ -462,13 +631,13 @@ async function route(request, env) {
 
   const offerAssignmentsMatch = path.match(/^\/api\/admin\/offers\/([^/]+)\/assignments$/);
   if (offerAssignmentsMatch && method === "GET") {
-    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     const rows = await env.DB.prepare("SELECT oa.user_id,u.display_name,u.username FROM offer_assignments oa JOIN users u ON u.id=oa.user_id WHERE oa.offer_id=? ORDER BY u.display_name").bind(offerAssignmentsMatch[1]).all();
     return response({users:rows.results||[]},200,request);
   }
 
   if (path === "/api/admin/offers" && method === "POST") {
-    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    if (!hasStaffPermission(user, method, path)) return response({ error: "Insufficient role permission." }, 403, request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS offers (
       id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
       description TEXT NOT NULL, benefit TEXT NOT NULL DEFAULT '', cta_label TEXT NOT NULL DEFAULT 'Explore offer',
@@ -490,7 +659,7 @@ async function route(request, env) {
 
   const offerMatch = path.match(/^\/api\/admin\/offers\/([^/]+)$/);
   if (offerMatch && method === "PATCH") {
-    if (user.role !== "admin") return response({ error: "Admin permission required." }, 403, request);
+    if (!hasStaffPermission(user, method, path)) return response({ error: "Insufficient role permission." }, 403, request);
     const d = await body(request), current = await env.DB.prepare("SELECT * FROM offers WHERE id=?").bind(offerMatch[1]).first();
     if (!current) return response({ error: "Offer not found." }, 404, request);
     const active = d.active === undefined ? current.active : (d.active ? 1 : 0);
@@ -504,7 +673,7 @@ async function route(request, env) {
   const loanApplicationDelete = path.match(/^\/api\/admin\/loans\/([^/]+)$/);
   const cardApplicationDelete = path.match(/^\/api\/admin\/cards\/([^/]+)$/);
   if (method === "DELETE" && (offerDelete || loanApplicationDelete || cardApplicationDelete)) {
-    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     const d = await body(request), note = String(d.note||"Removed from active review list").trim().slice(0,240);
     if (offerDelete) {
       await ensureColumn(env,"offers","deleted_at","TEXT");
@@ -525,7 +694,7 @@ async function route(request, env) {
   }
 
   if (method === "GET" && path === "/api/admin/treasury") {
-    if(user.role!=="admin") return response({error:"Admin permission required."},403,request);
+    if(!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     await ensureTreasury(env);
     const account=await env.DB.prepare("SELECT * FROM treasury_accounts WHERE id='nova-treasury-main'").first();
     const rows=await env.DB.prepare("SELECT * FROM treasury_ledger ORDER BY created_at DESC LIMIT 500").all();
@@ -534,7 +703,7 @@ async function route(request, env) {
     return response({account,transactions:rows.results||[],totals:totals||{}},200,request);
   }
   if (method === "POST" && path === "/api/admin/treasury/fund") {
-    if (!user || user.role !== "admin") return response({error:"Authenticated admin permission required."},403,request);
+    if (!user || !isSuperAdmin(user)) return response({error:"Super Admin permission required."},403,request);
     await ensureTreasury(env);
     const d = await body(request);
     const kind = String(d.kind || "manual_funding");
@@ -567,7 +736,7 @@ async function route(request, env) {
   }
 
   if (method === "GET" && path === "/api/accounts") {
-    const rows = user.role === "admin"
+    const rows = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT a.*,u.display_name,u.username FROM accounts a JOIN users u ON u.id=a.user_id ORDER BY a.opened_at DESC LIMIT 500").all()
       : await env.DB.prepare("SELECT * FROM accounts WHERE user_id=?").bind(user.id).all();
     return response({ accounts: rows.results || [] }, 200, request);
@@ -578,15 +747,15 @@ async function route(request, env) {
 
     // Customers may load recent activity before selecting an account.
     // In that case, return transactions for all accounts they own.
-    if (user.role === "admin" && !accountId) {
+    if ((isSuperAdmin(user) || staffRole(user)==='auditor') && !accountId) {
       q = env.DB.prepare(
         "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id ORDER BY l.created_at DESC LIMIT 500"
       );
-    } else if (!accountId && user.role !== "admin") {
+    } else if (!accountId && !isSuperAdmin(user) && staffRole(user)!=='auditor') {
       q = env.DB.prepare(
         "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.user_id=? ORDER BY l.created_at DESC LIMIT 200"
       ).bind(user.id);
-    } else if (user.role === "admin") {
+    } else if (isSuperAdmin(user) || staffRole(user)==='auditor') {
       q = env.DB.prepare(
         "SELECT l.*,a.account_number FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE a.id=? ORDER BY l.created_at DESC LIMIT 200"
       ).bind(accountId);
@@ -616,7 +785,7 @@ async function route(request, env) {
       admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
       reviewed_by TEXT REFERENCES users(id), review_token TEXT
     )`).run();
-    const rows = user.role === "admin"
+    const rows = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300").all()
       : await env.DB.prepare("SELECT r.*,a.account_number FROM money_requests r JOIN accounts a ON a.id=r.account_id WHERE r.user_id=? ORDER BY r.created_at DESC LIMIT 100").bind(user.id).all();
     return response({ requests: rows.results || [] }, 200, request);
@@ -643,7 +812,7 @@ async function route(request, env) {
     return response({ok:true,requestId:id,message:"Request submitted for admin approval. Your balance has not changed."},201,request);
   }
   if (method === "GET" && path === "/api/admin/money-requests") {
-    if (user.role !== 'admin') return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
       type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
@@ -653,12 +822,15 @@ async function route(request, env) {
     )`).run();
     await ensureColumn(env, "money_requests", "deleted_at", "TEXT");
     const archived = new URL(request.url).searchParams.get("archived") === "1";
-    const rows=await env.DB.prepare(`SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id WHERE ${archived ? "r.deleted_at IS NOT NULL" : "r.deleted_at IS NULL"} ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 300`).all();
+    const branchScoped=staffRole(user)==='branch_manager';
+    const where = `${archived ? "r.deleted_at IS NOT NULL" : "r.deleted_at IS NULL"}` + (branchScoped ? ` AND a.branch_id=?` : ``);
+    const query=`SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id WHERE ${where} ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 300`;
+    const rows=branchScoped?await env.DB.prepare(query).bind(user.staff_branch_id||'NB-HQ').all():await env.DB.prepare(query).all();
     return response({requests:rows.results||[]},200,request);
   }
   const moneyArchive = path.match(/^\/api\/admin\/money-requests\/([^/]+)\/archive$/);
   if (moneyArchive && method === "POST") {
-    if (user.role !== 'admin') return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
       type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
@@ -668,7 +840,8 @@ async function route(request, env) {
     )`).run();
     await ensureColumn(env, "money_requests", "deleted_at", "TEXT");
     const d=await body(request), note=String(d.note||"Hidden from active queue").trim().slice(0,250);
-    const row=await env.DB.prepare("SELECT id,user_id,status,type,amount FROM money_requests WHERE id=? AND deleted_at IS NULL").bind(moneyArchive[1]).first();
+    const row=await env.DB.prepare("SELECT r.id,r.user_id,r.status,r.type,r.amount,a.branch_id FROM money_requests r JOIN accounts a ON a.id=r.account_id WHERE r.id=? AND r.deleted_at IS NULL").bind(moneyArchive[1]).first();
+    if(row && staffRole(user)==='branch_manager' && row.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Request is outside your assigned branch scope.'},403,request);
     if(!row) return response({error:"Active money request not found."},404,request);
     if(!["approved","rejected"].includes(row.status)) return response({error:"Only reviewed requests can be archived. Approve or reject it first."},409,request);
     const changed=await env.DB.prepare("UPDATE money_requests SET deleted_at=datetime('now') WHERE id=? AND deleted_at IS NULL AND status IN ('approved','rejected')").bind(row.id).run();
@@ -678,7 +851,7 @@ async function route(request, env) {
   }
   const moneyReview = path.match(/^\/api\/admin\/money-requests\/([^/]+)\/review$/);
   if (moneyReview && method === "POST") {
-    if (user.role !== 'admin') return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
       type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
@@ -688,7 +861,8 @@ async function route(request, env) {
     )`).run();
     const d=await body(request), status=String(d.status||''), note=String(d.note||'').trim().slice(0,250);
     if(!['approved','rejected'].includes(status)) return response({error:'Choose approve or reject.'},400,request);
-    const r=await env.DB.prepare("SELECT * FROM money_requests WHERE id=?").bind(moneyReview[1]).first();
+    const r=await env.DB.prepare("SELECT r.*,a.branch_id FROM money_requests r JOIN accounts a ON a.id=r.account_id WHERE r.id=?").bind(moneyReview[1]).first();
+    if(r && staffRole(user)==='branch_manager' && r.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Request is outside your assigned branch scope.'},403,request);
     if(!r) return response({error:'Money request not found.'},404,request);
     if(r.status!=='pending') return response({error:`This request has already been ${r.status}.`},409,request);
     if(status==='rejected') {
@@ -806,17 +980,18 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/account-closure-requests") {
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT 'pending',note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id))`).run();
-    const rows=user.role==='admin'?await env.DB.prepare("SELECT r.*,u.display_name,u.username FROM account_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY r.created_at DESC").all():await env.DB.prepare("SELECT * FROM account_closure_requests WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    const rows=isSuperAdmin(user)?await env.DB.prepare("SELECT r.*,u.display_name,u.username FROM account_closure_requests r JOIN users u ON u.id=r.user_id ORDER BY r.created_at DESC").all():staffRole(user)==='branch_manager'?await env.DB.prepare("SELECT DISTINCT r.*,u.display_name,u.username FROM account_closure_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.user_id=r.user_id WHERE a.branch_id=? ORDER BY r.created_at DESC").bind(user.staff_branch_id||'NB-HQ').all():await env.DB.prepare("SELECT * FROM account_closure_requests WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({requests:rows.results||[]},200,request);
   }
   const accountClosureReview = path.match(/^\/api\/admin\/account-closure-requests\/([^/]+)\/review$/);
   if (method === "POST" && accountClosureReview) {
-    if (user.role !== "admin") return response({error:"Admin access required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS account_closure_requests (id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),status TEXT NOT NULL DEFAULT 'pending',note TEXT NOT NULL DEFAULT '',admin_note TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL DEFAULT (datetime('now')),reviewed_at TEXT,reviewed_by TEXT REFERENCES users(id))`).run();
     const d=await body(request), status=String(d.status||"");
     if(!["approved","rejected"].includes(status)) return response({error:"Choose approve or reject."},400,request);
     const req=await env.DB.prepare("SELECT * FROM account_closure_requests WHERE id=? AND status='pending'").bind(accountClosureReview[1]).first();
     if(!req) return response({error:"Pending account closure request not found."},404,request);
+    if(staffRole(user)==='branch_manager') { const scope=await env.DB.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN branch_id=? THEN 1 ELSE 0 END) AS in_branch FROM accounts WHERE user_id=?").bind(user.staff_branch_id||'NB-HQ',req.user_id).first(); if(!Number(scope?.in_branch||0)||Number(scope?.total||0)!==Number(scope?.in_branch||0)) return response({error:'Customer is outside your assigned branch scope.'},403,request); }
     if(status==="approved") {
       const activeLoan=await env.DB.prepare("SELECT id FROM demo_loans WHERE user_id=? AND status='active' AND outstanding_amount>0 LIMIT 1").bind(req.user_id).first();
       const activeCard=await env.DB.prepare("SELECT id FROM virtual_cards WHERE user_id=? AND status IN ('active','inactive') AND outstanding>0 LIMIT 1").bind(req.user_id).first();
@@ -890,7 +1065,7 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/loans") {
     await ensureColumn(env,"loan_applications","deleted_at","TEXT");
-    const rows = user.role === "admin" ? await env.DB.prepare("SELECT l.*,u.display_name,u.username FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NULL ORDER BY l.created_at DESC").all() : await env.DB.prepare("SELECT * FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    const rows = (isSuperAdmin(user)||staffRole(user)==='loan_officer') ? await env.DB.prepare("SELECT l.*,u.display_name,u.username FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NULL ORDER BY l.created_at DESC").all() : await env.DB.prepare("SELECT * FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "POST" && path === "/api/cards") {
@@ -912,7 +1087,7 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/cards") {
     await ensureColumn(env,"card_applications","deleted_at","TEXT");
-    const rows = user.role === "admin" ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NULL ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    const rows = (isSuperAdmin(user)||staffRole(user)==='credit_officer') ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NULL ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "GET" && path === "/api/products") {
@@ -924,15 +1099,15 @@ async function route(request, env) {
       monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`).run();
-    await reconcileZeroCardOutstanding(env, user.role === "admin" ? null : user.id);
-    const loans = user.role === "admin"
+    await reconcileZeroCardOutstanding(env, isSuperAdmin(user) ? null : user.id);
+    const loans = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT * FROM demo_loans ORDER BY created_at DESC LIMIT 500").all()
       : await env.DB.prepare("SELECT * FROM demo_loans WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
-    const cards = user.role === "admin"
+    const cards = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT * FROM virtual_cards ORDER BY created_at DESC LIMIT 500").all()
       : await env.DB.prepare("SELECT * FROM virtual_cards WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     await ensureCardTransactions(env);
-    const cardTransactions = user.role === "admin"
+    const cardTransactions = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT * FROM card_transactions ORDER BY created_at DESC LIMIT 300").all()
       : await env.DB.prepare("SELECT * FROM card_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT 100").bind(user.id).all();
     return response({ loans: loans.results || [], cards: cards.results || [], cardTransactions: cardTransactions.results || [] }, 200, request);
@@ -1002,7 +1177,7 @@ async function route(request, env) {
     return response({ok:true,message:`Demo EMI paid. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`},200,request);
   }
   if (method === "POST" && path.startsWith("/api/admin/")) {
-    if (user.role !== "admin") return response({error:"Admin permission required."},403,request);
+    if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     const d = await body(request);
 
     const cardControlReview=path.match(/^\/api\/admin\/card-control-requests\/([^/]+)\/review$/);
@@ -1207,7 +1382,7 @@ async function route(request, env) {
     return response({requests:rows.results||[]},200,request);
   }
   if(method==='GET' && path==='/api/admin/card-control-requests'){
-    if(user.role!=='admin') return response({error:'Admin permission required.'},403,request);
+    if(!hasStaffPermission(user, method, path)) return response({error:'Insufficient role permission.'},403,request);
     const rows=await env.DB.prepare(`SELECT r.*,u.display_name,u.username,c.masked_number,c.outstanding FROM card_control_requests r JOIN users u ON u.id=r.user_id JOIN virtual_cards c ON c.id=r.card_id ORDER BY CASE r.status WHEN 'pending' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 300`).all();
     return response({requests:rows.results||[]},200,request);
   }
@@ -1280,7 +1455,7 @@ async function route(request, env) {
     return response({notifications:rows.results||[]},200,request);
   }
   if (method === "GET" && path === "/api/admin/audit") {
-    if(user.role!=="admin") return response({error:"Admin permission required."},403,request);
+    if(!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     const rows=await env.DB.prepare("SELECT * FROM audit_events ORDER BY created_at DESC LIMIT 300").all();
     return response({events:rows.results||[]},200,request);
   }
@@ -1292,7 +1467,7 @@ export default {
     try { return await route(request, env); }
     catch (e) {
       // Do not expose database details or stack traces to clients.
-      return new Response(JSON.stringify({ error: "Unexpected server error. Check Worker logs." }), { status: 500, headers: { "content-type": "application/json", "cache-control": "no-store", ...corsHeaders(request) } });
+      return new Response(JSON.stringify({ error: "Unexpected server error. Check Worker logs." }), { status: 500, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options":"nosniff", "referrer-policy":"no-referrer", "x-frame-options":"DENY", ...corsHeaders(request) } });
     }
   }
 };
