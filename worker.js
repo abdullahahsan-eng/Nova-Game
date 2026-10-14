@@ -651,8 +651,30 @@ async function route(request, env) {
       admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
       reviewed_by TEXT REFERENCES users(id), review_token TEXT
     )`).run();
-    const rows=await env.DB.prepare("SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 300").all();
+    await ensureColumn(env, "money_requests", "deleted_at", "TEXT");
+    const archived = new URL(request.url).searchParams.get("archived") === "1";
+    const rows=await env.DB.prepare(`SELECT r.*,u.display_name,u.username,a.account_number FROM money_requests r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id WHERE ${archived ? "r.deleted_at IS NOT NULL" : "r.deleted_at IS NULL"} ORDER BY CASE r.status WHEN 'pending' THEN 0 WHEN 'processing' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 300`).all();
     return response({requests:rows.results||[]},200,request);
+  }
+  const moneyArchive = path.match(/^\/api\/admin\/money-requests\/([^/]+)\/archive$/);
+  if (moneyArchive && method === "POST") {
+    if (user.role !== 'admin') return response({error:"Admin permission required."},403,request);
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS money_requests (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+      type TEXT NOT NULL CHECK(type IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount > 0),
+      description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','approved','rejected')),
+      admin_note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT,
+      reviewed_by TEXT REFERENCES users(id), review_token TEXT
+    )`).run();
+    await ensureColumn(env, "money_requests", "deleted_at", "TEXT");
+    const d=await body(request), note=String(d.note||"Hidden from active queue").trim().slice(0,250);
+    const row=await env.DB.prepare("SELECT id,user_id,status,type,amount FROM money_requests WHERE id=? AND deleted_at IS NULL").bind(moneyArchive[1]).first();
+    if(!row) return response({error:"Active money request not found."},404,request);
+    if(!["approved","rejected"].includes(row.status)) return response({error:"Only reviewed requests can be archived. Approve or reject it first."},409,request);
+    const changed=await env.DB.prepare("UPDATE money_requests SET deleted_at=datetime('now') WHERE id=? AND deleted_at IS NULL AND status IN ('approved','rejected')").bind(row.id).run();
+    if(!Number(changed.meta?.changes||0)) return response({error:"Request changed while archiving. Refresh the queue."},409,request);
+    await audit(env,user,"money_request_archived","money_request",row.id,{status:row.status,type:row.type,amount:row.amount,note});
+    return response({ok:true,message:"Reviewed request hidden from active list; transaction and audit history are preserved."},200,request);
   }
   const moneyReview = path.match(/^\/api\/admin\/money-requests\/([^/]+)\/review$/);
   if (moneyReview && method === "POST") {
