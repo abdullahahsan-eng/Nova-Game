@@ -89,3 +89,13 @@ body{overflow-x:hidden;}
 .work-grid{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:18px!important;max-width:1200px!important;margin:0 auto!important;padding:0 24px!important;box-sizing:border-box!important;}
 @media(max-width:1100px){.topbar{align-items:flex-start!important}.top-right.top-actions-premium{flex-wrap:wrap!important;justify-content:flex-end!important}.top-actions-premium .top-action{font-size:12px!important;padding:9px 10px!important}.quick-nav{position:relative!important;top:auto!important}.work-grid{grid-template-columns:1fr!important}}
 @media(max-width:760px){.topbar{flex-direction:column!important;align-items:stretch!important}.top-right.top-actions-premium{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;width:100%!important}.top-actions-premium .top-action{width:100%!important;white-space:normal!important}.top-actions-premium #openAccountModal{min-width:0!important}.top-actions-premium .demo-pill{grid-column:1/-1!important;text-align:center!important}.promo-wrap{padding:0 16px!important}.promo-slide,.promo-slide.active{flex-direction:column!important;align-items:flex-start!important;padding:22px!important}.promo-art{width:100%!important;flex-basis:auto!important;min-height:80px!important}.quick-nav{gap:6px!important;padding:8px!important}.quick-nav a{font-size:12px!important;padding:8px 10px!important}.offers-grid{grid-template-columns:1fr!important}.work-grid{padding:0 16px!important}#dashboard{padding:0 16px!important}}
+
+
+/* Authenticated customer workspace: remove public marketing landing blocks. */
+body.customer-session .hero,
+body.customer-session .promo-wrap,
+body.customer-session .top-actions-premium #openAccountModal,
+body.customer-session .top-actions-premium #openLoginModal,
+body.customer-session .top-actions-premium #openHelpModal,
+body.customer-session .top-actions-premium #openRecoveryModal { display:none !important; }
+body.customer-session #dashboard { display:block; }
