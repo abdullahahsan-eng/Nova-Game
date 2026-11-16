@@ -1080,8 +1080,12 @@ async function route(request, env) {
     // Existing outstanding informs the risk adjustment; this is not a real credit decision.
     const suggested=Math.max(0,Math.min(20000000,Math.round(monthlySurplus*3*Math.max(0.25,1-Math.min(0.75,(debt+loanOutstanding)/Math.max(income*12,1))))));
     const id=uid();
+    // requested_limit is constrained to be positive in the existing D1 schema.
+    // Keep the application submit-able even when the eligibility estimate is zero;
+    // admin still makes the final decision and the suggested limit remains transparent.
+    const requestedLimit=Math.max(10000,suggested);
     await env.DB.prepare("INSERT INTO card_applications(id,user_id,requested_limit,monthly_income,monthly_expenses,existing_debt,suggested_limit,existing_emi,loan_outstanding) VALUES(?,?,?,?,?,?,?,?,?)")
-      .bind(id,user.id,0,income,expenses,debt,suggested,emi,loanOutstanding).run();
+      .bind(id,user.id,requestedLimit,income,expenses,debt,suggested,emi,loanOutstanding).run();
     await audit(env,user,"card_application_submitted","card_application",id,{income,expenses,existingEmi:emi,existingCardDebt:debt,loanOutstanding,suggestedLimit:suggested});
     return response({ok:true,id,suggestedLimit:suggested/100,message:"Demo card application submitted for bank assessment."},201,request);
   }
