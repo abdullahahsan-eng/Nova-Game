@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS virtual_cards (
   credit_limit INTEGER NOT NULL DEFAULT 0,
   outstanding INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','blocked','closed')),
+  activation_pending INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

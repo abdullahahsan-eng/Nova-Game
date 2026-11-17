@@ -150,6 +150,9 @@ async function ensureCardColumns(env) {
   await ensureColumn(env, "card_applications", "existing_emi", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "virtual_cards", "demo_number", "TEXT NOT NULL DEFAULT ''");
+  // Keep the existing virtual_cards CHECK constraint intact. A closed status plus
+  // this flag represents an approved card awaiting customer activation.
+  await ensureColumn(env, "virtual_cards", "activation_pending", "INTEGER NOT NULL DEFAULT 0");
 }
 // Repair legacy cards whose stored outstanding is zero even though recorded card
 // activity shows an unpaid balance. Never overwrite a non-zero stored balance.
@@ -1096,6 +1099,7 @@ async function route(request, env) {
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "GET" && path === "/api/products") {
+    await ensureCardColumns(env);
     await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
       id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
       user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -1353,7 +1357,7 @@ async function route(request, env) {
         const finalLimit = Number(amount);
         const suffix = String(card.id).replace(/[^a-z0-9]/gi,"").slice(-4).toUpperCase().padStart(4,"0");
         const demoHash = await digest(card.id); const demoNumber = "9000" + demoHash.slice(0,12).replace(/[^0-9]/g,"7").padEnd(12,"7") + suffix;
-        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number) VALUES(?,?,?,?,0,'inactive',?) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='inactive', demo_number=excluded.demo_number").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
+        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number,activation_pending) VALUES(?,?,?,?,0,'closed',?,1) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='closed', activation_pending=1, demo_number=excluded.demo_number").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
       }
       await notify(env,card.user_id,"Virtual card application update",`Your demo card application status is now: ${status}. ${String(d.note||"")}`);
       await audit(env,user,"card_review","card_application",card.id,{status,amount,note:d.note||""});
@@ -1398,11 +1402,12 @@ async function route(request, env) {
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardActivateMatch[1],user.id).first();
     if (!card) return response({error:"Virtual card not found."},404,request);
     if (card.status === "blocked") return response({error:"Blocked card must be unblocked by an admin."},400,request);
+    if (Number(card.activation_pending)!==1 || card.status!=="closed") return response({error:"This card is not awaiting activation."},409,request);
     const joiningFee=50000;
     if(Number(card.credit_limit)<joiningFee) return response({error:"Approved card limit must be at least N₹500 to cover the demo joining fee."},400,request);
     await ensureCardTransactions(env);
     const feeGroup=uid();
-    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',outstanding=outstanding+? WHERE id=? AND user_id=? AND status='inactive' AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
+    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',activation_pending=0,outstanding=outstanding+? WHERE id=? AND user_id=? AND status='closed' AND activation_pending=1 AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
     if(!Number(activated.meta?.changes||0)) return response({error:"Card could not be activated safely. Refresh and check its status/available limit."},409,request);
     await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,feeGroup,"joining_fee",joiningFee,"Nova Rewards Card joining fee (N₹500)").run();
     await postTreasury(env,user,"card_joining_fee",joiningFee,"N₹500 demo card joining fee","virtual_card",card.id,feeGroup);
