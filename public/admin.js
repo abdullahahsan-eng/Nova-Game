@@ -42,8 +42,8 @@ async function loadApplications(){
       if(box)box.innerHTML=`<p class="error">${esc(label)}: ${esc(result.reason?.message||"Could not load applications.")}</p>`;
       return [];
     }
-    const payload=result.value||{};
-    const rows=Array.isArray(payload.applications)?payload.applications:[];
+    const payload=result.value && typeof result.value==="object" ? result.value : {};
+    const rows=Array.isArray(payload.applications) ? payload.applications.filter(Boolean) : [];
     if(box && !rows.length)box.innerHTML=`<p class="empty">No ${label.toLowerCase()} found.</p>`;
     return rows;
   };
