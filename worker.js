@@ -1471,7 +1471,13 @@ export default {
   async fetch(request, env) {
     try { return await route(request, env); }
     catch (e) {
-      // Do not expose database details or stack traces to clients.
+      // Keep internal diagnostics in Cloudflare Worker logs; never expose them to customers.
+      console.error("NovaBank Worker request failed", {
+        method: request.method,
+        path: new URL(request.url).pathname,
+        error: String(e?.message || e),
+        stack: String(e?.stack || "")
+      });
       return new Response(JSON.stringify({ error: "Unexpected server error. Check Worker logs." }), { status: 500, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options":"nosniff", "referrer-policy":"no-referrer", "x-frame-options":"DENY", ...corsHeaders(request) } });
     }
   }
