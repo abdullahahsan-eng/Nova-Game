@@ -11,3 +11,5 @@ run_worker_first = ["/api/*"]
 binding = "DB"
 database_name = "novabank-db"
 database_id = "14b259cc-6a03-47f1-84c9-2206abc8ff55"
+# wrangler.toml
+name = 'nova-game'
