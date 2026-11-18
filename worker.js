@@ -150,6 +150,9 @@ async function ensureCardColumns(env) {
   await ensureColumn(env, "card_applications", "existing_emi", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "virtual_cards", "demo_number", "TEXT NOT NULL DEFAULT ''");
+  await ensureColumn(env, "virtual_cards", "activation_pending", "INTEGER NOT NULL DEFAULT 0");
+  // Legacy builds used an unsupported 'inactive' status; migrate it without rebuilding D1.
+  await env.DB.prepare("UPDATE virtual_cards SET status='active',activation_pending=1 WHERE status='inactive'").run();
 }
 // Repair legacy cards whose stored outstanding is zero even though recorded card
 // activity shows an unpaid balance. Never overwrite a non-zero stored balance.
@@ -489,7 +492,7 @@ async function route(request, env) {
   }
   const cardClosure = path.match(/^\/api\/cards\/([^/]+)\/closure-request$/);
   if (method === "POST" && cardClosure) {
-    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status IN ('active','inactive','blocked')").bind(cardClosure[1],user.id).first();
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status IN ('active','blocked')").bind(cardClosure[1],user.id).first();
     if(!card) return response({error:"Demo card not found or already closed."},404,request);
     if(Number(card.outstanding)>0) return response({error:`Please clear card dues of N₹${(Number(card.outstanding)/100).toFixed(2)} before requesting closure.`},400,request);
     const duplicate=await env.DB.prepare("SELECT id FROM product_closure_requests WHERE product_type='card' AND product_id=? AND status='pending'").bind(card.id).first();
@@ -673,6 +676,9 @@ async function route(request, env) {
     if (!isSuperAdmin(user)) return response({error:"Super Admin permission required."},403,request);
     await ensureColumn(env,"loan_applications","deleted_at","TEXT");
     await ensureColumn(env,"card_applications","deleted_at","TEXT");
+    // Preserve legacy final decisions in the archive, without deleting application rows.
+    await env.DB.prepare("UPDATE loan_applications SET deleted_at=COALESCE(deleted_at,updated_at,created_at,datetime('now')) WHERE status IN ('approved','rejected') AND deleted_at IS NULL").run();
+    await env.DB.prepare("UPDATE card_applications SET deleted_at=COALESCE(deleted_at,updated_at,created_at,datetime('now')) WHERE status IN ('approved','rejected') AND deleted_at IS NULL").run();
     const [loanRows,cardRows] = await Promise.all([
       env.DB.prepare("SELECT l.id,l.user_id,l.requested_amount AS amount,l.sanctioned_amount AS sanctioned,l.status,l.admin_note,l.created_at,l.updated_at,l.deleted_at,u.display_name,u.username,'loan' AS product_type FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NOT NULL ORDER BY l.deleted_at DESC LIMIT 300").all(),
       env.DB.prepare("SELECT c.id,c.user_id,c.requested_limit AS amount,c.sanctioned_limit AS sanctioned,c.status,c.admin_note,c.created_at,c.updated_at,c.deleted_at,u.display_name,u.username,'card' AS product_type FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NOT NULL ORDER BY c.deleted_at DESC LIMIT 300").all()
@@ -1007,7 +1013,7 @@ async function route(request, env) {
     if(staffRole(user)==='branch_manager') { const scope=await env.DB.prepare("SELECT COUNT(*) AS total,SUM(CASE WHEN branch_id=? THEN 1 ELSE 0 END) AS in_branch FROM accounts WHERE user_id=?").bind(user.staff_branch_id||'NB-HQ',req.user_id).first(); if(!Number(scope?.in_branch||0)||Number(scope?.total||0)!==Number(scope?.in_branch||0)) return response({error:'Customer is outside your assigned branch scope.'},403,request); }
     if(status==="approved") {
       const activeLoan=await env.DB.prepare("SELECT id FROM demo_loans WHERE user_id=? AND status='active' AND outstanding_amount>0 LIMIT 1").bind(req.user_id).first();
-      const activeCard=await env.DB.prepare("SELECT id FROM virtual_cards WHERE user_id=? AND status IN ('active','inactive') AND outstanding>0 LIMIT 1").bind(req.user_id).first();
+      const activeCard=await env.DB.prepare("SELECT id FROM virtual_cards WHERE user_id=? AND status='active' AND outstanding>0 LIMIT 1").bind(req.user_id).first();
       if(activeLoan||activeCard) return response({error:"Account cannot close while a demo loan or credit card has outstanding dues."},409,request);
       await env.DB.batch([
         env.DB.prepare("UPDATE accounts SET status='closed' WHERE user_id=? AND status='active'").bind(req.user_id),
@@ -1025,7 +1031,7 @@ async function route(request, env) {
     if (!dest || dest.user_id===user.id) return response({ error: "Check recipient account. Transfers to your own demo account are not supported." }, 400, request);
     if (String(d.paymentMethod||"account")==="credit_card") {
       await ensureCardColumns(env);
-      const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active'").bind(String(d.fromCreditCardId||""),user.id).first();
+      const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active' AND activation_pending=0").bind(String(d.fromCreditCardId||""),user.id).first();
       if(!card) return response({error:"Select an active linked demo credit card."},400,request);
       const fee=Math.round(amount*0.009), total=amount+fee, available=Number(card.credit_limit||0)-Number(card.outstanding||0);
       if(total>available) return response({error:`Insufficient available demo credit. Transfer plus 0.9% fee requires N₹${(total/100).toFixed(2)}.`},400,request);
@@ -1078,7 +1084,10 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/loans") {
     await ensureColumn(env,"loan_applications","deleted_at","TEXT");
-    const rows = (isSuperAdmin(user)||staffRole(user)==='loan_officer') ? await env.DB.prepare("SELECT l.*,u.display_name,u.username FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NULL ORDER BY l.created_at DESC").all() : await env.DB.prepare("SELECT * FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    await env.DB.prepare("UPDATE loan_applications SET deleted_at=COALESCE(deleted_at,updated_at,created_at,datetime('now')) WHERE status IN ('approved','rejected') AND deleted_at IS NULL").run();
+    const rows = (isSuperAdmin(user)||staffRole(user)==='loan_officer')
+      ? await env.DB.prepare("SELECT l.*,u.display_name,u.username FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NULL AND l.status IN ('pending','need_documents','verified') ORDER BY l.created_at DESC").all()
+      : await env.DB.prepare("SELECT * FROM loan_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "POST" && path === "/api/cards") {
@@ -1105,7 +1114,10 @@ async function route(request, env) {
   }
   if (method === "GET" && path === "/api/cards") {
     await ensureColumn(env,"card_applications","deleted_at","TEXT");
-    const rows = (isSuperAdmin(user)||staffRole(user)==='credit_officer') ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NULL ORDER BY c.created_at DESC").all() : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
+    await env.DB.prepare("UPDATE card_applications SET deleted_at=COALESCE(deleted_at,updated_at,created_at,datetime('now')) WHERE status IN ('approved','rejected') AND deleted_at IS NULL").run();
+    const rows = (isSuperAdmin(user)||staffRole(user)==='credit_officer')
+      ? await env.DB.prepare("SELECT c.*,u.display_name,u.username FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NULL AND c.status IN ('pending','need_documents','verified') ORDER BY c.created_at DESC").all()
+      : await env.DB.prepare("SELECT * FROM card_applications WHERE user_id=? ORDER BY created_at DESC").bind(user.id).all();
     return response({ applications: rows.results || [] },200,request);
   }
   if (method === "GET" && path === "/api/products") {
@@ -1228,7 +1240,7 @@ async function route(request, env) {
         const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(req.product_id,req.user_id).first();
         if(!card) return response({error:"Card record not found; cannot safely archive this request."},404,request);
         if(Number(card.outstanding)>0) return response({error:"This card has outstanding dues. Resolve the card before archiving its pending closure request."},409,request);
-        if(card.status==='closure_pending') await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,req.user_id).run();
+        if(card.status==='closure_pending') await env.DB.prepare("UPDATE virtual_cards SET status='active',activation_pending=0 WHERE id=? AND user_id=? AND status='closure_pending'").bind(card.id,req.user_id).run();
         else if(!['active','inactive','blocked'].includes(card.status)) return response({error:`Cannot archive a pending closure request while the card status is ${card.status}.`},409,request);
       }
       const changed=await env.DB.prepare("UPDATE product_closure_requests SET deleted_at=datetime('now') WHERE id=? AND deleted_at IS NULL").bind(req.id).run();
@@ -1276,7 +1288,7 @@ async function route(request, env) {
           // marked the card closure_pending, restore it to inactive; otherwise keep
           // the current usable/blocked state instead of failing on a status mismatch.
           if(card.status==='closure_pending') {
-            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='inactive' WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
+            const changed=await env.DB.prepare("UPDATE virtual_cards SET status='active',activation_pending=0 WHERE id=? AND user_id=? AND status='closure_pending' AND outstanding=0").bind(card.id,r.user_id).run();
             if(!Number(changed.meta?.changes||0)) return response({error:"Card status changed during rejection. Refresh and review again."},409,request);
           } else if(!['active','inactive','blocked'].includes(card.status)) {
             return response({error:`Card closure cannot be rejected because the card is ${card.status}. Inspect the card before retrying.`},409,request);
@@ -1366,7 +1378,7 @@ async function route(request, env) {
         const finalLimit = Number(amount);
         const suffix = String(card.id).replace(/[^a-z0-9]/gi,"").slice(-4).toUpperCase().padStart(4,"0");
         const demoHash = await digest(card.id); const demoNumber = "9000" + demoHash.slice(0,12).replace(/[^0-9]/g,"7").padEnd(12,"7") + suffix;
-        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number) VALUES(?,?,?,?,0,'inactive',?) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='inactive', demo_number=excluded.demo_number").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
+        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number,activation_pending) VALUES(?,?,?,?,0,'active',?,1) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='active', demo_number=excluded.demo_number, activation_pending=1").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
       }
       await notify(env,card.user_id,"Virtual card application update",`Your demo card application status is now: ${status}. ${String(d.note||"")}`);
       await audit(env,user,"card_review","card_application",card.id,{status,amount,note:d.note||""});
@@ -1383,8 +1395,9 @@ async function route(request, env) {
   if(method==='POST' && cardControlRequest){
     const d=await body(request), action=String(d.action||'').toLowerCase();
     if(!['block','unblock'].includes(action)) return response({error:'Choose block or unblock.'},400,request);
-    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status IN ('active','blocked','inactive')").bind(cardControlRequest[1],user.id).first();
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status IN ('active','blocked')").bind(cardControlRequest[1],user.id).first();
     if(!card) return response({error:'Eligible demo card not found.'},404,request);
+    if(Number(card.activation_pending||0)===1) return response({error:'Activate the card before requesting card controls.'},409,request);
     if(action==='unblock' && card.status!=='blocked') return response({error:'Only a blocked card can request unblocking.'},409,request);
     if(action==='block' && card.status!=='active') return response({error:'Only an active card can be blocked.'},409,request);
     const duplicate=await env.DB.prepare("SELECT id FROM card_control_requests WHERE card_id=? AND action=? AND status='pending'").bind(card.id,action).first();
@@ -1411,11 +1424,12 @@ async function route(request, env) {
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardActivateMatch[1],user.id).first();
     if (!card) return response({error:"Virtual card not found."},404,request);
     if (card.status === "blocked") return response({error:"Blocked card must be unblocked by an admin."},400,request);
+    if (Number(card.activation_pending||0)!==1) return response({error:"This card is not awaiting activation. Refresh your card details."},409,request);
     const joiningFee=50000;
     if(Number(card.credit_limit)<joiningFee) return response({error:"Approved card limit must be at least N₹500 to cover the demo joining fee."},400,request);
     await ensureCardTransactions(env);
     const feeGroup=uid();
-    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',outstanding=outstanding+? WHERE id=? AND user_id=? AND status='inactive' AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
+    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',activation_pending=0,outstanding=outstanding+? WHERE id=? AND user_id=? AND status='active' AND activation_pending=1 AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
     if(!Number(activated.meta?.changes||0)) return response({error:"Card could not be activated safely. Refresh and check its status/available limit."},409,request);
     await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,feeGroup,"joining_fee",joiningFee,"Nova Rewards Card joining fee (N₹500)").run();
     await postTreasury(env,user,"card_joining_fee",joiningFee,"N₹500 demo card joining fee","virtual_card",card.id,feeGroup);
@@ -1426,6 +1440,7 @@ async function route(request, env) {
   if (method === "POST" && cardBlockMatch) {
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardBlockMatch[1],user.id).first();
     if (!card) return response({error:"Virtual card not found."},404,request);
+    if(Number(card.activation_pending||0)===1) return response({error:"Activate the card before blocking it."},409,request);
     await env.DB.prepare("UPDATE virtual_cards SET status='blocked' WHERE id=? AND user_id=?").bind(card.id,user.id).run();
     await audit(env,user,"demo_card_blocked","virtual_card",card.id);
     return response({ok:true,message:"Demo card blocked."},200,request);
@@ -1434,7 +1449,7 @@ async function route(request, env) {
   if (method === "POST" && cardPurchaseMatch) {
     const d=await body(request), amount=Math.round(Number(d.amount)*100), merchant=String(d.merchant||"Demo Store").trim().slice(0,80);
     if(!Number.isSafeInteger(amount)||amount<100||amount>20000000) return response({error:"Enter a purchase amount between N₹1 and N₹200,000."},400,request);
-    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active'").bind(cardPurchaseMatch[1],user.id).first();
+    const card=await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=? AND status='active' AND activation_pending=0").bind(cardPurchaseMatch[1],user.id).first();
     if(!card) return response({error:"Card is not active."},400,request);
     if(Number(card.credit_limit)-Number(card.outstanding)<amount) return response({error:"Insufficient available demo credit."},400,request);
     const result=await env.DB.prepare("UPDATE virtual_cards SET outstanding=outstanding+? WHERE id=? AND user_id=? AND status='active' AND credit_limit-outstanding>=?").bind(amount,card.id,user.id,amount).run();
