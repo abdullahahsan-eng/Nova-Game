@@ -23,3 +23,16 @@ Important:
 - No real deposits, real money, payment rails, or actual financial services.
 - Admin and API flows need testing against a backup/test account before relying on them.
 - Summary amounts are derived from demo ledger and simulated product tables; they are not a statement of actual bank capital/reserves.
+
+
+## NovaBank upgrade (November 2026)
+
+- Adds readable, unique loan/card application numbers and exact customer tracking.
+- Hides rejected/closed applications from the default customer request list while retaining rows for application-number lookup and admin search.
+- Loan sanctions support a 5% processing fee plus ₹1,100 file charge deducted from the sanctioned principal; the net amount is credited to the customer account.
+- EMI is calculated on sanctioned principal at 0% demo interest, with a persisted month-by-month schedule.
+- Adds Super Admin application search and account-number-based manual deposit/withdrawal with ledger, Treasury, notification and audit entries.
+- Adds customer notification display and printable fictional loan sanction letters.
+- Fixes virtual-card approval to use the schema-supported `active` status with `activation_pending=1`.
+
+The Worker applies additive D1 migrations at runtime. Do not delete or recreate the existing D1 database.
