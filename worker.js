@@ -150,10 +150,6 @@ async function ensureCardColumns(env) {
   await ensureColumn(env, "card_applications", "existing_emi", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "card_applications", "loan_outstanding", "INTEGER NOT NULL DEFAULT 0");
   await ensureColumn(env, "virtual_cards", "demo_number", "TEXT NOT NULL DEFAULT ''");
-  // Keep the table's existing status CHECK constraint intact. A newly approved
-  // card is stored as blocked + activation_pending until the customer pays the
-  // fictional joining fee; this avoids inserting unsupported "inactive" status.
-  await ensureColumn(env, "virtual_cards", "activation_pending", "INTEGER NOT NULL DEFAULT 0");
 }
 // Repair legacy cards whose stored outstanding is zero even though recorded card
 // activity shows an unpaid balance. Never overwrite a non-zero stored balance.
@@ -670,6 +666,19 @@ async function route(request, env) {
     await env.DB.prepare("UPDATE offers SET active=?, updated_at=datetime('now') WHERE id=?").bind(active, current.id).run();
     await audit(env, user, active ? "offer_activated" : "offer_deactivated", "offer", current.id, { title: current.title });
     return response({ ok: true, active }, 200, request);
+  }
+
+  // Archived loan/card applications remain queryable by Super Admin; source rows are never deleted.
+  if (method === "GET" && path === "/api/admin/application-archive") {
+    if (!isSuperAdmin(user)) return response({error:"Super Admin permission required."},403,request);
+    await ensureColumn(env,"loan_applications","deleted_at","TEXT");
+    await ensureColumn(env,"card_applications","deleted_at","TEXT");
+    const [loanRows,cardRows] = await Promise.all([
+      env.DB.prepare("SELECT l.id,l.user_id,l.requested_amount AS amount,l.sanctioned_amount AS sanctioned,l.status,l.admin_note,l.created_at,l.updated_at,l.deleted_at,u.display_name,u.username,'loan' AS product_type FROM loan_applications l JOIN users u ON u.id=l.user_id WHERE l.deleted_at IS NOT NULL ORDER BY l.deleted_at DESC LIMIT 300").all(),
+      env.DB.prepare("SELECT c.id,c.user_id,c.requested_limit AS amount,c.sanctioned_limit AS sanctioned,c.status,c.admin_note,c.created_at,c.updated_at,c.deleted_at,u.display_name,u.username,'card' AS product_type FROM card_applications c JOIN users u ON u.id=c.user_id WHERE c.deleted_at IS NOT NULL ORDER BY c.deleted_at DESC LIMIT 300").all()
+    ]);
+    const applications=[...(loanRows.results||[]),...(cardRows.results||[])].sort((a,b)=>String(b.deleted_at||"").localeCompare(String(a.deleted_at||""))).slice(0,500);
+    return response({applications},200,request);
   }
 
   // Soft-delete admin catalogue/review records: retain rows for audit and customer history.
@@ -1338,7 +1347,7 @@ async function route(request, env) {
       const loan=await env.DB.prepare("SELECT * FROM loan_applications WHERE id=?").bind(loanMatch[1]).first();
       if(!loan) return response({error:"Application not found."},404,request);
       if(status==="approved" && (!Number.isSafeInteger(amount)||amount<100||amount>loan.requested_amount)) return response({error:"Approved amount must be positive and not exceed requested amount."},400,request);
-      await env.DB.prepare("UPDATE loan_applications SET status=?,sanctioned_amount=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status,amount,String(d.note||""),loan.id).run();
+      await env.DB.prepare("UPDATE loan_applications SET status=?,sanctioned_amount=?,admin_note=?,deleted_at=CASE WHEN ? IN ('approved','rejected') THEN COALESCE(deleted_at,datetime('now')) ELSE NULL END,updated_at=datetime('now') WHERE id=?").bind(status,amount,String(d.note||""),status,loan.id).run();
       await notify(env,loan.user_id,"Loan application update",`Your demo loan application status is now: ${status}. ${String(d.note||"")}`);
       await audit(env,user,"loan_review","loan_application",loan.id,{status,amount,note:d.note||""});
       return response({ok:true},200,request);
@@ -1352,12 +1361,12 @@ async function route(request, env) {
       const card=await env.DB.prepare("SELECT * FROM card_applications WHERE id=?").bind(cardMatch[1]).first();
       if(!card) return response({error:"Application not found."},404,request);
       if(status==="approved"&&(!Number.isSafeInteger(amount)||amount<100||amount>20000000)) return response({error:"Approved limit must be between N₹1 and N₹200,000."},400,request);
-      await env.DB.prepare("UPDATE card_applications SET status=?,sanctioned_limit=?,admin_note=?,updated_at=datetime('now') WHERE id=?").bind(status,amount,String(d.note||""),card.id).run();
+      await env.DB.prepare("UPDATE card_applications SET status=?,sanctioned_limit=?,admin_note=?,deleted_at=CASE WHEN ? IN ('approved','rejected') THEN COALESCE(deleted_at,datetime('now')) ELSE NULL END,updated_at=datetime('now') WHERE id=?").bind(status,amount,String(d.note||""),status,card.id).run();
       if(status==="approved") {
         const finalLimit = Number(amount);
         const suffix = String(card.id).replace(/[^a-z0-9]/gi,"").slice(-4).toUpperCase().padStart(4,"0");
         const demoHash = await digest(card.id); const demoNumber = "9000" + demoHash.slice(0,12).replace(/[^0-9]/g,"7").padEnd(12,"7") + suffix;
-        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number,activation_pending) VALUES(?,?,?,?,0,'blocked',?,1) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='blocked', demo_number=excluded.demo_number, activation_pending=1").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
+        await env.DB.prepare("INSERT INTO virtual_cards(id,user_id,masked_number,credit_limit,outstanding,status,demo_number) VALUES(?,?,?,?,0,'inactive',?) ON CONFLICT(id) DO UPDATE SET credit_limit=excluded.credit_limit, status='inactive', demo_number=excluded.demo_number").bind(card.id,card.user_id,`•••• •••• •••• ${suffix}`,finalLimit,demoNumber).run();
       }
       await notify(env,card.user_id,"Virtual card application update",`Your demo card application status is now: ${status}. ${String(d.note||"")}`);
       await audit(env,user,"card_review","card_application",card.id,{status,amount,note:d.note||""});
@@ -1401,15 +1410,12 @@ async function route(request, env) {
     await ensureCardColumns(env);
     const card = await env.DB.prepare("SELECT * FROM virtual_cards WHERE id=? AND user_id=?").bind(cardActivateMatch[1],user.id).first();
     if (!card) return response({error:"Virtual card not found."},404,request);
-    if (!Number(card.activation_pending || 0)) {
-      if (card.status === "active") return response({ok:true,message:"Demo card is already active."},200,request);
-      return response({error:"This card is not awaiting first-time activation."},400,request);
-    }
+    if (card.status === "blocked") return response({error:"Blocked card must be unblocked by an admin."},400,request);
     const joiningFee=50000;
     if(Number(card.credit_limit)<joiningFee) return response({error:"Approved card limit must be at least N₹500 to cover the demo joining fee."},400,request);
     await ensureCardTransactions(env);
     const feeGroup=uid();
-    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',activation_pending=0,outstanding=outstanding+? WHERE id=? AND user_id=? AND status='blocked' AND activation_pending=1 AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
+    const activated=await env.DB.prepare("UPDATE virtual_cards SET status='active',outstanding=outstanding+? WHERE id=? AND user_id=? AND status='inactive' AND credit_limit-outstanding>=?").bind(joiningFee,card.id,user.id,joiningFee).run();
     if(!Number(activated.meta?.changes||0)) return response({error:"Card could not be activated safely. Refresh and check its status/available limit."},409,request);
     await env.DB.prepare("INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),card.id,user.id,feeGroup,"joining_fee",joiningFee,"Nova Rewards Card joining fee (N₹500)").run();
     await postTreasury(env,user,"card_joining_fee",joiningFee,"N₹500 demo card joining fee","virtual_card",card.id,feeGroup);
@@ -1478,13 +1484,7 @@ export default {
   async fetch(request, env) {
     try { return await route(request, env); }
     catch (e) {
-      // Keep internal diagnostics in Cloudflare Worker logs; never expose them to customers.
-      console.error("NovaBank Worker request failed", {
-        method: request.method,
-        path: new URL(request.url).pathname,
-        error: String(e?.message || e),
-        stack: String(e?.stack || "")
-      });
+      // Do not expose database details or stack traces to clients.
       return new Response(JSON.stringify({ error: "Unexpected server error. Check Worker logs." }), { status: 500, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options":"nosniff", "referrer-policy":"no-referrer", "x-frame-options":"DENY", ...corsHeaders(request) } });
     }
   }
