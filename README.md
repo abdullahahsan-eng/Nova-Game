@@ -36,3 +36,13 @@ Important:
 - Fixes virtual-card approval to use the schema-supported `active` status with `activation_pending=1`.
 
 The Worker applies additive D1 migrations at runtime. Do not delete or recreate the existing D1 database.
+
+
+## Branch Counter and loan account numbers
+- Activated demo loans receive a permanent `NVL-YYYY-XXXXXXXXXX` Loan Account Number.
+- Authenticated customers can look up a loan and pay it from their own account, including another customer's loan.
+- Partial payments are allocated oldest-installment-first and tracked in `loan_emi_schedule.paid_amount`; excess payment can cover following installments up to the outstanding balance.
+- Staff with Cashier or Branch Manager permissions use `/branch.html` for cash deposit/withdrawal, loan collections, and credit-card bill collection. Super Admin can also access the Branch Counter.
+- Credit-card lookup requires the cardholder account number plus card last four digits; full card number, CVV and PIN are never requested.
+- Treasury reports inflow, outflow, ledger balance and a type-by-type collection/revenue breakdown.
+- All features are fictional simulator operations in NVR/Nova Rupee; no real payments or financial instruments are created.

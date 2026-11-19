@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS loan_applications (
   monthly_expenses INTEGER NOT NULL DEFAULT 0,
   existing_emi INTEGER NOT NULL DEFAULT 0,
   eligible_suggestion INTEGER NOT NULL DEFAULT 0,
+  application_number TEXT UNIQUE,
+  processing_fee INTEGER NOT NULL DEFAULT 0,
+  file_charge INTEGER NOT NULL DEFAULT 0,
+  net_disbursement INTEGER NOT NULL DEFAULT 0,
   sanctioned_amount INTEGER,
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','need_documents','verified','approved','rejected','accepted','disbursed','closed')),
   admin_note TEXT NOT NULL DEFAULT '',
@@ -68,6 +72,7 @@ CREATE TABLE IF NOT EXISTS card_applications (
   monthly_expenses INTEGER NOT NULL DEFAULT 0,
   existing_debt INTEGER NOT NULL DEFAULT 0,
   suggested_limit INTEGER NOT NULL DEFAULT 0,
+  application_number TEXT UNIQUE,
   sanctioned_limit INTEGER,
   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','need_documents','verified','approved','rejected','accepted','active','blocked','closed')),
   admin_note TEXT NOT NULL DEFAULT '',
@@ -106,6 +111,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_date ON audit_events(created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_loan_application_number ON loan_applications(application_number) WHERE application_number IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_card_application_number ON card_applications(application_number) WHERE application_number IS NOT NULL;
 
 
 -- Internal fictional treasury ledger. Worker also creates/migrates these tables lazily.
@@ -122,6 +129,28 @@ CREATE TABLE IF NOT EXISTS treasury_ledger (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_treasury_ledger_reference ON treasury_ledger(reference) WHERE reference IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_treasury_single_opening_balance ON treasury_ledger(type) WHERE type='opening_balance';
 CREATE TABLE IF NOT EXISTS treasury_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS demo_loans (
+  id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+  user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+  principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL, tenure_months INTEGER NOT NULL,
+  remaining_months INTEGER NOT NULL, monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+  processing_fee INTEGER NOT NULL DEFAULT 0, file_charge INTEGER NOT NULL DEFAULT 0, net_disbursed INTEGER NOT NULL DEFAULT 0, loan_number TEXT UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS loan_emi_schedule (
+  id TEXT PRIMARY KEY, loan_id TEXT NOT NULL REFERENCES demo_loans(id), application_id TEXT NOT NULL REFERENCES loan_applications(id),
+  installment_no INTEGER NOT NULL, due_date TEXT NOT NULL, amount INTEGER NOT NULL CHECK(amount>0),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid','waived')),
+  paid_at TEXT, transaction_group TEXT, paid_amount INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(loan_id,installment_no)
+);
+CREATE INDEX IF NOT EXISTS idx_loan_emi_due ON loan_emi_schedule(loan_id,status,due_date);
+CREATE TABLE IF NOT EXISTS manual_account_operations (
+  id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), actor_user_id TEXT NOT NULL REFERENCES users(id),
+  operation TEXT NOT NULL CHECK(operation IN ('deposit','withdrawal')), amount INTEGER NOT NULL CHECK(amount>0),
+  reason TEXT NOT NULL, transaction_group TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS card_control_requests (
   id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), card_id TEXT NOT NULL REFERENCES virtual_cards(id),
   action TEXT NOT NULL CHECK(action IN ('block','unblock')), status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
@@ -136,3 +165,26 @@ CREATE TABLE IF NOT EXISTS card_transactions (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_card_transactions_card_date ON card_transactions(card_id,created_at DESC);
+
+
+-- Additive teller and third-party repayment records. Existing customer/ledger rows remain untouched.
+CREATE TABLE IF NOT EXISTS loan_payment_records (
+  id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, loan_id TEXT NOT NULL REFERENCES demo_loans(id),
+  loan_number TEXT NOT NULL, borrower_user_id TEXT NOT NULL REFERENCES users(id), payer_user_id TEXT REFERENCES users(id),
+  payer_account_id TEXT REFERENCES accounts(id), payment_method TEXT NOT NULL CHECK(payment_method IN ('cash','account')),
+  amount INTEGER NOT NULL CHECK(amount>0), reference TEXT NOT NULL UNIQUE, actor_user_id TEXT REFERENCES users(id),
+  allocations_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS branch_cash_operations (
+  id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, account_id TEXT NOT NULL REFERENCES accounts(id),
+  actor_user_id TEXT NOT NULL REFERENCES users(id), operation TEXT NOT NULL CHECK(operation IN ('deposit','withdrawal')),
+  amount INTEGER NOT NULL CHECK(amount>0), reason TEXT NOT NULL, reference TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS branch_card_payment_records (
+  id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, card_id TEXT NOT NULL REFERENCES virtual_cards(id),
+  card_owner_user_id TEXT NOT NULL REFERENCES users(id), payer_user_id TEXT REFERENCES users(id),
+  payer_account_id TEXT REFERENCES accounts(id), payment_method TEXT NOT NULL CHECK(payment_method IN ('cash','account')),
+  amount INTEGER NOT NULL CHECK(amount>0), reference TEXT NOT NULL UNIQUE, actor_user_id TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

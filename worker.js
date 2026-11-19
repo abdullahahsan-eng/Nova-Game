@@ -30,6 +30,7 @@ async function ensureSecurityTables(env) {
   await ensureColumn(env, 'accounts', 'branch_id', "TEXT NOT NULL DEFAULT 'NB-HQ'");
   await ensureColumn(env, 'users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
   await env.DB.prepare("UPDATE accounts SET branch_id='NB-HQ' WHERE branch_id IS NULL OR branch_id='' ").run();
+  await env.DB.prepare("UPDATE staff_roles SET branch_id='NB-HQ' WHERE branch_id IS NULL OR branch_id='' " ).run();
   await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_accounts_branch ON accounts(branch_id)').run();
 }
 function isSuperAdmin(user) { return !!user && user.role === 'admin'; }
@@ -42,11 +43,11 @@ function hasStaffPermission(user, method, path) {
     match(/^\/api\/admin\/customers$/, ['GET']) || match(/^\/api\/admin\/customer-details$/, ['GET']) ||
     match(/^\/api\/admin\/accounts\/[^/]+\/status$/, ['POST']) || match(/^\/api\/admin\/money-requests$/, ['GET']) ||
     match(/^\/api\/admin\/money-requests\/[^/]+\/(review|archive)$/, ['POST']) ||
-    match(/^\/api\/account-closure-requests$/, ['GET']) || match(/^\/api\/admin\/account-closure-requests\/[^/]+\/review$/, ['POST'])
+    match(/^\/api\/account-closure-requests$/, ['GET']) || match(/^\/api\/admin\/account-closure-requests\/[^/]+\/review$/, ['POST']) || match(/^\/api\/branch\/(account-lookup|loan-lookup|card-lookup)$/, ['GET']) || match(/^\/api\/branch\/(account-operation|loan-payment|card-payment)$/, ['POST'])
   );
   if (r === 'loan_officer') return match(/^\/api\/loans$/, ['GET']) || match(/^\/api\/admin\/loans\/[^/]+\/review$/, ['POST']);
   if (r === 'credit_officer') return match(/^\/api\/cards$/, ['GET']) || match(/^\/api\/admin\/cards\/[^/]+\/review$/, ['POST']) || match(/^\/api\/admin\/card-control-requests$/, ['GET']) || match(/^\/api\/admin\/card-control-requests\/[^/]+\/review$/, ['POST']);
-  if (r === 'cashier') return match(/^\/api\/admin\/money-requests$/, ['GET']) || match(/^\/api\/admin\/money-requests\/[^/]+\/(review|archive)$/, ['POST']);
+  if (r === 'cashier') return match(/^\/api\/admin\/money-requests$/, ['GET']) || match(/^\/api\/admin\/money-requests\/[^/]+\/(review|archive)$/, ['POST']) || match(/^\/api\/branch\/(account-lookup|loan-lookup|card-lookup)$/, ['GET']) || match(/^\/api\/branch\/(account-operation|loan-payment|card-payment)$/, ['POST']);
   if (r === 'auditor') return match(/^\/api\/transactions$/, ['GET']) || match(/^\/api\/admin\/audit$/, ['GET']) || match(/^\/api\/admin\/summary$/, ['GET']);
   return false;
 }
@@ -248,6 +249,45 @@ async function ensureCardBillPayments(env) {
         THEN RAISE(ABORT,'Treasury ledger entry is missing') END;
     END`).run();
 }
+async function ensureBranchOperations(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
+    id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
+    user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
+    principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL, tenure_months INTEGER NOT NULL,
+    remaining_months INTEGER NOT NULL, monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+    processing_fee INTEGER NOT NULL DEFAULT 0, file_charge INTEGER NOT NULL DEFAULT 0, net_disbursed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await ensureColumn(env,'demo_loans','loan_number','TEXT');
+  await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_demo_loan_number ON demo_loans(loan_number) WHERE loan_number IS NOT NULL").run();
+  await env.DB.prepare("UPDATE demo_loans SET loan_number='NVL-'||strftime('%Y',created_at)||'-'||upper(substr(replace(id,'-',''),1,10)) WHERE loan_number IS NULL OR loan_number='' ").run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS loan_emi_schedule (id TEXT PRIMARY KEY,loan_id TEXT NOT NULL REFERENCES demo_loans(id),application_id TEXT NOT NULL REFERENCES loan_applications(id),installment_no INTEGER NOT NULL,due_date TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid','waived')),paid_at TEXT,transaction_group TEXT,created_at TEXT NOT NULL DEFAULT (datetime('now')),UNIQUE(loan_id,installment_no))`).run();
+  await env.DB.prepare("ALTER TABLE loan_emi_schedule ADD COLUMN paid_amount INTEGER NOT NULL DEFAULT 0").run().catch(()=>{});
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS loan_payment_records (
+    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, loan_id TEXT NOT NULL REFERENCES demo_loans(id),
+    loan_number TEXT NOT NULL, borrower_user_id TEXT NOT NULL REFERENCES users(id), payer_user_id TEXT REFERENCES users(id),
+    payer_account_id TEXT REFERENCES accounts(id), payment_method TEXT NOT NULL CHECK(payment_method IN ('cash','account')),
+    amount INTEGER NOT NULL CHECK(amount>0), reference TEXT NOT NULL UNIQUE, actor_user_id TEXT REFERENCES users(id),
+    allocations_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS branch_cash_operations (
+    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, account_id TEXT NOT NULL REFERENCES accounts(id),
+    actor_user_id TEXT NOT NULL REFERENCES users(id), operation TEXT NOT NULL CHECK(operation IN ('deposit','withdrawal')),
+    amount INTEGER NOT NULL CHECK(amount>0), reason TEXT NOT NULL, reference TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS branch_card_payment_records (
+    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, card_id TEXT NOT NULL REFERENCES virtual_cards(id),
+    card_owner_user_id TEXT NOT NULL REFERENCES users(id), payer_user_id TEXT REFERENCES users(id),
+    payer_account_id TEXT REFERENCES accounts(id), payment_method TEXT NOT NULL CHECK(payment_method IN ('cash','account')),
+    amount INTEGER NOT NULL CHECK(amount>0), reference TEXT NOT NULL UNIQUE, actor_user_id TEXT REFERENCES users(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+}
+async function branchAllowed(user, method, path) {
+  if (isSuperAdmin(user)) return true;
+  return hasStaffPermission(user, method, path);
+}
 async function route(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -408,9 +448,9 @@ async function route(request, env) {
     try {
       await env.DB.batch([
         env.DB.prepare("INSERT INTO users(id,username,display_name,email,password_hash,password_salt,role,status) VALUES(?,?,?,?,?,?,'admin','active')").bind(id,username,displayName,email,hash,salt),
-        env.DB.prepare("INSERT INTO staff_roles(user_id,role_name,branch_id,is_active,created_by) VALUES(?,?,?,1,?)").bind(id,role,role==='branch_manager'?branchId:null,user.id)
+        env.DB.prepare("INSERT INTO staff_roles(user_id,role_name,branch_id,is_active,created_by) VALUES(?,?,?,1,?)").bind(id,role,branchId,user.id)
       ]);
-      await audit(env,user,'staff_created','staff_user',id,{username,role,branchId:role==='branch_manager'?branchId:null});
+      await audit(env,user,'staff_created','staff_user',id,{username,role,branchId});
       return response({ok:true,message:'Staff account created. Share the initial password securely.'},201,request);
     } catch (_) { return response({error:'Username or email already exists; no staff account was created.'},409,request); }
   }
@@ -436,9 +476,9 @@ async function route(request, env) {
     if (!STAFF_ROLES.has(role)) return response({error:'Invalid staff role.'},400,request);
     const branch=await env.DB.prepare("SELECT id FROM branches WHERE id=? AND status='active'").bind(branchId).first();
     if (role==='branch_manager'&&!branch) return response({error:'Select an active branch.'},400,request);
-    await env.DB.prepare("UPDATE staff_roles SET role_name=?,branch_id=?,is_active=?,updated_at=datetime('now') WHERE user_id=?").bind(role,role==='branch_manager'?branchId:null,active,staffMatch[1]).run();
+    await env.DB.prepare("UPDATE staff_roles SET role_name=?,branch_id=?,is_active=?,updated_at=datetime('now') WHERE user_id=?").bind(role,branchId,active,staffMatch[1]).run();
     if (!active) await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(staffMatch[1]).run();
-    await audit(env,user,active?'staff_role_updated':'staff_access_revoked','staff_user',staffMatch[1],{role,active,branchId:role==='branch_manager'?branchId:null});
+    await audit(env,user,active?'staff_role_updated':'staff_access_revoked','staff_user',staffMatch[1],{role,active,branchId});
     return response({ok:true,message:active?'Staff permissions updated.':'Staff access disabled and sessions revoked.'},200,request);
   }
 
@@ -632,7 +672,7 @@ async function route(request, env) {
     if (!['active','frozen'].includes(status)) return response({ error: "Choose active or frozen." }, 400, request);
     const account = await env.DB.prepare("SELECT a.*,u.id AS owner_id,u.display_name,u.username FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.id=?").bind(accountStatusMatch[1]).first();
     if (!account) return response({ error: "Account not found." }, 404, request);
-    if (staffRole(user)==='branch_manager' && account.branch_id !== (user.staff_branch_id||'NB-HQ')) return response({error:'Account is outside your assigned branch scope.'},403,request);
+    if (user.staff_branch_id && account.branch_id !== (user.staff_branch_id||'NB-HQ')) return response({error:'Account is outside your assigned branch scope.'},403,request);
     if (account.status === status) return response({ ok:true, status, message:`Account is already ${status}.` }, 200, request);
     const note = String(d.note || "").trim().slice(0,250);
     await env.DB.prepare("UPDATE accounts SET status=? WHERE id=?").bind(status, account.id).run();
@@ -769,9 +809,10 @@ async function route(request, env) {
     await ensureTreasury(env);
     const account=await env.DB.prepare("SELECT * FROM treasury_accounts WHERE id='nova-treasury-main'").first();
     const rows=await env.DB.prepare("SELECT * FROM treasury_ledger ORDER BY created_at DESC LIMIT 500").all();
-    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COALESCE(SUM(amount),0) AS balance,COUNT(*) AS entries FROM treasury_ledger").first();
+    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COALESCE(SUM(amount),0) AS balance,COUNT(*) AS entries,COALESCE(SUM(CASE WHEN type IN ('loan_processing_fee','loan_file_charge','card_joining_fee','credit_card_transfer_fee','merchant_commission','subscription_revenue','service_fee') THEN amount ELSE 0 END),0) AS revenue FROM treasury_ledger").first();
+    const breakdown=await env.DB.prepare("SELECT type,COALESCE(SUM(amount),0) AS amount,COUNT(*) AS entries FROM treasury_ledger GROUP BY type ORDER BY ABS(SUM(amount)) DESC").all();
     account.current_balance=Number(totals?.balance||0);
-    return response({account,transactions:rows.results||[],totals:totals||{}},200,request);
+    return response({account,transactions:rows.results||[],totals:totals||{},breakdown:breakdown.results||[]},200,request);
   }
   if (method === "POST" && path === "/api/admin/treasury/fund") {
     if (!user || !isSuperAdmin(user)) return response({error:"Super Admin permission required."},403,request);
@@ -912,7 +953,7 @@ async function route(request, env) {
     await ensureColumn(env, "money_requests", "deleted_at", "TEXT");
     const d=await body(request), note=String(d.note||"Hidden from active queue").trim().slice(0,250);
     const row=await env.DB.prepare("SELECT r.id,r.user_id,r.status,r.type,r.amount,a.branch_id FROM money_requests r JOIN accounts a ON a.id=r.account_id WHERE r.id=? AND r.deleted_at IS NULL").bind(moneyArchive[1]).first();
-    if(row && staffRole(user)==='branch_manager' && row.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Request is outside your assigned branch scope.'},403,request);
+    if(row && user.staff_branch_id && row.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Request is outside your assigned branch scope.'},403,request);
     if(!row) return response({error:"Active money request not found."},404,request);
     if(!["approved","rejected"].includes(row.status)) return response({error:"Only reviewed requests can be archived. Approve or reject it first."},409,request);
     const changed=await env.DB.prepare("UPDATE money_requests SET deleted_at=datetime('now') WHERE id=? AND deleted_at IS NULL AND status IN ('approved','rejected')").bind(row.id).run();
@@ -933,7 +974,7 @@ async function route(request, env) {
     const d=await body(request), status=String(d.status||''), note=String(d.note||'').trim().slice(0,250);
     if(!['approved','rejected'].includes(status)) return response({error:'Choose approve or reject.'},400,request);
     const r=await env.DB.prepare("SELECT r.*,a.branch_id FROM money_requests r JOIN accounts a ON a.id=r.account_id WHERE r.id=?").bind(moneyReview[1]).first();
-    if(r && staffRole(user)==='branch_manager' && r.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Request is outside your assigned branch scope.'},403,request);
+    if(r && user.staff_branch_id && r.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Request is outside your assigned branch scope.'},403,request);
     if(!r) return response({error:'Money request not found.'},404,request);
     if(r.status!=='pending') return response({error:`This request has already been ${r.status}.`},409,request);
     if(status==='rejected') {
@@ -1203,6 +1244,7 @@ async function route(request, env) {
       monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`).run();
+    await ensureBranchOperations(env);
     await reconcileZeroCardOutstanding(env, isSuperAdmin(user) ? null : user.id);
     const loans = isSuperAdmin(user)
       ? await env.DB.prepare("SELECT * FROM demo_loans ORDER BY created_at DESC LIMIT 500").all()
@@ -1242,7 +1284,8 @@ async function route(request, env) {
     await ensureColumn(env,"demo_loans","processing_fee","INTEGER NOT NULL DEFAULT 0");
     await ensureColumn(env,"demo_loans","file_charge","INTEGER NOT NULL DEFAULT 0");
     await ensureColumn(env,"demo_loans","net_disbursed","INTEGER NOT NULL DEFAULT 0");
-    const id=uid(), amount=Number(loan.sanctioned_amount), tenure=Number(loan.tenure_months), processingFee=Number(loan.processing_fee||Math.round(amount*0.05)), fileCharge=Number(loan.file_charge||110000), netDisbursement=Number(loan.net_disbursement||amount-processingFee-fileCharge), monthly=Math.floor(amount/tenure), group=uid();
+    await ensureBranchOperations(env);
+    const id=uid(), loanNumber=`NVL-${new Date().getFullYear()}-${id.replace(/-/g,'').slice(0,10).toUpperCase()}`, amount=Number(loan.sanctioned_amount), tenure=Number(loan.tenure_months), processingFee=Number(loan.processing_fee||Math.round(amount*0.05)), fileCharge=Number(loan.file_charge||110000), netDisbursement=Number(loan.net_disbursement||amount-processingFee-fileCharge), monthly=Math.floor(amount/tenure), group=uid();
     if(netDisbursement<=0 || netDisbursement!==amount-processingFee-fileCharge) return response({error:"The approved loan fee calculation is invalid. Please ask the admin to review the offer again."},409,request);
     await ensureTreasury(env);
     const treasuryFunds = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger").first();
@@ -1251,7 +1294,7 @@ async function route(request, env) {
     const schedule=[]; let allocated=0;
     for(let n=1;n<=tenure;n++){const installment=n===tenure?amount-allocated:monthly;allocated+=installment;schedule.push({id:uid(),n,due:emiDueDate(n),amount:installment});}
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO demo_loans(id,application_id,user_id,account_id,principal_amount,outstanding_amount,tenure_months,remaining_months,monthly_payment,status,processing_fee,file_charge,net_disbursed) VALUES(?,?,?,?,?,?,?,?,?,'active',?,?,?)").bind(id,loan.id,user.id,account.id,amount,amount,tenure,tenure,Math.floor(amount/tenure),processingFee,fileCharge,netDisbursement),
+      env.DB.prepare("INSERT INTO demo_loans(id,application_id,user_id,account_id,principal_amount,outstanding_amount,tenure_months,remaining_months,monthly_payment,status,processing_fee,file_charge,net_disbursed,loan_number) VALUES(?,?,?,?,?,?,?,?,?,'active',?,?,?,?)").bind(id,loan.id,user.id,account.id,amount,amount,tenure,tenure,Math.floor(amount/tenure),processingFee,fileCharge,netDisbursement,loanNumber),
       env.DB.prepare("UPDATE accounts SET balance=balance+? WHERE id=? AND user_id=?").bind(netDisbursement,account.id,user.id),
       env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"loan_disbursement",netDisbursement,Number(account.balance)+netDisbursement,`Net demo loan disbursement · ${loan.application_number||loan.id}`),
       env.DB.prepare("UPDATE loan_applications SET status='disbursed',updated_at=datetime('now') WHERE id=? AND user_id=? AND status='approved'").bind(loan.id,user.id),
@@ -1260,41 +1303,142 @@ async function route(request, env) {
     await postTreasury(env,user,"loan_disbursement",-netDisbursement,`Net loan disbursement · ${id}`,"demo_loan",id,group);
     await postTreasury(env,user,"loan_processing_fee",processingFee,`5% demo loan processing fee · ${id}`,"demo_loan",id,group);
     await postTreasury(env,user,"loan_file_charge",fileCharge,`Demo loan file charge · ${id}`,"demo_loan",id,group);
-    await notify(env,user.id,"Demo loan activated",`Loan ${loan.application_number||loan.id} disbursed. Sanction: N₹${(amount/100).toFixed(2)}; processing fee: N₹${(processingFee/100).toFixed(2)}; file charge: N₹${(fileCharge/100).toFixed(2)}; net credited: N₹${(netDisbursement/100).toFixed(2)}. Your ${tenure}-month, 0% demo EMI schedule is ready.`);
+    await notify(env,user.id,"Demo loan activated",`Loan ${loanNumber} disbursed. Sanction: N₹${(amount/100).toFixed(2)}; processing fee: N₹${(processingFee/100).toFixed(2)}; file charge: N₹${(fileCharge/100).toFixed(2)}; net credited: N₹${(netDisbursement/100).toFixed(2)}. Your ${tenure}-month, 0% demo EMI schedule is ready.`);
     await audit(env,user,"demo_loan_disbursed","demo_loan",id,{applicationId:loan.id,applicationNumber:loan.application_number,amount,tenure,processingFee,fileCharge,netDisbursement,interestRate:0});
-    return response({ok:true,message:`Demo loan disbursed. Net amount credited: N₹${(netDisbursement/100).toFixed(2)} after 5% processing fee and ₹1,100 file charge. EMI schedule created for ${tenure} months.`},200,request);
+    return response({ok:true,loanNumber,message:`Demo loan disbursed. Loan Account Number: ${loanNumber}. Net amount credited: N₹${(netDisbursement/100).toFixed(2)} after 5% processing fee and ₹1,100 file charge. EMI schedule created for ${tenure} months.`},200,request);
   }
 
-  const repayLoanMatch = path.match(/^\/api\/loans\/([^/]+)\/repay$/);
-  if (method === "POST" && repayLoanMatch) {
-    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS demo_loans (
-      id TEXT PRIMARY KEY, application_id TEXT NOT NULL UNIQUE REFERENCES loan_applications(id),
-      user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT NOT NULL REFERENCES accounts(id),
-      principal_amount INTEGER NOT NULL, outstanding_amount INTEGER NOT NULL,
-      tenure_months INTEGER NOT NULL, remaining_months INTEGER NOT NULL,
-      monthly_payment INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )`).run();
-    const loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='active'").bind(repayLoanMatch[1],user.id).first();
-    if(!loan) return response({error:"Active demo loan not found."},404,request);
-    const account=await env.DB.prepare("SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'").bind(loan.account_id,user.id).first();
-    if(!account) return response({error:"No active account is available for repayment."},400,request);
-    const nextEmi=await env.DB.prepare("SELECT * FROM loan_emi_schedule WHERE loan_id=? AND status='pending' ORDER BY installment_no LIMIT 1").bind(loan.id).first();
-    const amount=Math.min(Number(nextEmi?.amount||loan.monthly_payment),Number(loan.outstanding_amount));
-    if(Number(account.balance)<amount) return response({error:`Insufficient demo balance. Your next demo EMI is N₹${(amount/100).toFixed(2)}.`},400,request);
-    const outstanding=Math.max(0,Number(loan.outstanding_amount)-amount), remaining=outstanding===0?0:Math.max(0,Number(loan.remaining_months)-1), status=outstanding===0?"closed":"active", group=uid();
-    await env.DB.batch([
-      env.DB.prepare("UPDATE accounts SET balance=balance-? WHERE id=? AND user_id=? AND balance>=?").bind(amount,account.id,user.id,amount),
-      env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),account.id,group,"loan_repayment",amount,Number(account.balance)-amount,"Demo loan EMI repayment"),
-      env.DB.prepare("UPDATE demo_loans SET outstanding_amount=?,remaining_months=?,status=?,updated_at=datetime('now') WHERE id=? AND user_id=?").bind(outstanding,remaining,status,loan.id,user.id),
-      ...(nextEmi?[env.DB.prepare("UPDATE loan_emi_schedule SET status='paid',paid_at=datetime('now'),transaction_group=? WHERE id=? AND status='pending'").bind(group,nextEmi.id)]:[]),
-      ...(outstanding===0?[env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=? AND user_id=?").bind(loan.application_id,user.id)]:[])
-    ]);
-    await postTreasury(env,user,"loan_repayment",amount,`Demo loan EMI repayment · ${loan.id}`,"demo_loan",loan.id,group);
-    await notify(env,user.id,"Demo EMI recorded",`Your demo EMI payment of N₹${(amount/100).toFixed(2)} was recorded. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`);
-    await audit(env,user,"demo_loan_repayment","demo_loan",loan.id,{amount,outstanding,remaining});
-    return response({ok:true,message:`Demo EMI paid. Remaining outstanding: N₹${(outstanding/100).toFixed(2)}.`},200,request);
+  // Public-to-authenticated loan lookup reveals only the minimum details needed to pay a loan.
+  if (method === 'GET' && path === '/api/loan-lookup') {
+    await ensureBranchOperations(env);
+    const loanNumber=String(url.searchParams.get('loanNumber')||'').trim().toUpperCase();
+    if(!/^NVL-[0-9]{4}-[A-F0-9]{8,10}$/.test(loanNumber)) return response({error:'Enter a valid NovaBank Loan Account Number.'},400,request);
+    const loan=await env.DB.prepare(`SELECT l.loan_number,l.principal_amount,l.outstanding_amount,l.monthly_payment,l.tenure_months,l.remaining_months,l.status,l.created_at,u.display_name,a.account_number FROM demo_loans l JOIN users u ON u.id=l.user_id JOIN accounts a ON a.id=l.account_id WHERE l.loan_number=?`).bind(loanNumber).first();
+    if(!loan) return response({error:'Loan account not found.'},404,request);
+    const schedule=await env.DB.prepare("SELECT installment_no,due_date,amount,paid_amount,status FROM loan_emi_schedule WHERE loan_id=(SELECT id FROM demo_loans WHERE loan_number=?) ORDER BY installment_no").bind(loanNumber).all();
+    const next=(schedule.results||[]).find(x=>x.status!=='paid');
+    return response({loan:{loanNumber:loan.loan_number,borrower:loan.display_name,accountMasked:`••••${String(loan.account_number).slice(-4)}`,principal:loan.principal_amount,outstanding:loan.outstanding_amount,monthlyEmi:loan.monthly_payment,tenureMonths:loan.tenure_months,remainingMonths:loan.remaining_months,status:loan.status,nextDue:next?.due_date||null,nextDueAmount:next?Math.max(0,Number(next.amount)-Number(next.paid_amount||0)):0},schedule:schedule.results||[]},200,request);
   }
+  const oldRepayMatch=path.match(/^\/api\/loans\/([^/]+)\/repay$/);
+  const customerLoanPay=method==='POST' && path==='/api/loan-payments';
+  const branchLoanPay=method==='POST' && path==='/api/branch/loan-payment';
+  if ((method==='POST' && oldRepayMatch) || customerLoanPay || branchLoanPay) {
+    await ensureBranchOperations(env); await ensureTreasury(env);
+    const staffPayment=branchLoanPay;
+    if(staffPayment && !(await branchAllowed(user,method,path))) return response({error:'Branch teller permission required.'},403,request);
+    if(!staffPayment && STAFF_ROLES.has(staffRole(user))) return response({error:'Staff must use the Branch Counter.'},403,request);
+    const d=await body(request);
+    let loan;
+    if(oldRepayMatch) loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE id=? AND user_id=? AND status='active'").bind(oldRepayMatch[1],user.id).first();
+    else loan=await env.DB.prepare("SELECT * FROM demo_loans WHERE loan_number=? AND status='active'").bind(String(d.loanNumber||'').trim().toUpperCase()).first();
+    if(!loan) return response({error:'Active loan account not found.'},404,request);
+    const schedule=(await env.DB.prepare("SELECT * FROM loan_emi_schedule WHERE loan_id=? AND status IN ('pending') ORDER BY installment_no").bind(loan.id).all()).results||[];
+    const firstDue=schedule.find(x=>x.status!=='paid');
+    const amount=Math.round(Number(d.amount??(oldRepayMatch?Math.max(0,Number(firstDue?.amount||loan.monthly_payment)-Number(firstDue?.paid_amount||0))/100:0))*100), methodType=staffPayment?String(d.paymentMethod||'cash'):'account', idem=String(d.idempotencyKey||(oldRepayMatch?`legacy-${uid()}`:''));
+    if(!['cash','account'].includes(methodType)||!Number.isSafeInteger(amount)||amount<100||amount>Number(loan.outstanding_amount)) return response({error:'Enter a valid payment method and an amount from NVR 1 up to the current loan outstanding.'},400,request);
+    if(!/^[A-Za-z0-9._:-]{16,100}$/.test(idem)) return response({error:'Payment reference is missing. Refresh and retry.'},400,request);
+    const previous=await env.DB.prepare('SELECT reference,amount FROM loan_payment_records WHERE idempotency_key=?').bind(idem).first();
+    if(previous) return response({ok:true,alreadyProcessed:true,reference:previous.reference,message:'This payment was already recorded; no duplicate debit was made.'},200,request);
+    let payerAccount=null;
+    if(methodType==='account') {
+      const accountNumber=String(d.payerAccountNumber||'').trim().toUpperCase();
+      if(oldRepayMatch) payerAccount=await env.DB.prepare("SELECT a.*,u.id AS owner_id,u.display_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.id=? AND a.user_id=? AND a.status='active'").bind(loan.account_id,user.id).first();
+      else if(staffPayment) payerAccount=await env.DB.prepare("SELECT a.*,u.id AS owner_id,u.display_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=? AND a.status='active'").bind(accountNumber).first();
+      else payerAccount=await env.DB.prepare("SELECT a.*,u.id AS owner_id,u.display_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=? AND a.user_id=? AND a.status='active'").bind(accountNumber,user.id).first();
+      if(!payerAccount) return response({error:staffPayment?'Payer account not found or inactive.':'Select one of your own active NovaBank accounts.'},403,request);
+      if(staffPayment && user.staff_branch_id && payerAccount.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Payer account is outside your assigned branch.'},403,request);
+      if(Number(payerAccount.balance)<amount) return response({error:'Insufficient payer account balance.'},409,request);
+    }
+    let remaining=amount; const allocations=[];
+    for(const emi of schedule){ if(remaining<=0) break; const due=Math.max(0,Number(emi.amount)-Number(emi.paid_amount||0)); if(!due) continue; const applied=Math.min(due,remaining); allocations.push({id:emi.id,installmentNo:emi.installment_no,paidAfter:Number(emi.paid_amount||0)+applied,amount:Number(emi.amount),applied}); remaining-=applied; }
+    if(remaining>0) return response({error:'No pending EMI schedule is available for this loan. Contact the simulator administrator.'},409,request);
+    const outstanding=Number(loan.outstanding_amount)-amount, group=uid(), paymentId=uid(), reference=`NVP-${crypto.randomUUID().replace(/-/g,'').slice(0,16).toUpperCase()}`;
+    const operations=[];
+    if(payerAccount) {
+      operations.push(env.DB.prepare('UPDATE accounts SET balance=balance-? WHERE id=? AND status=\'active\' AND balance>=?').bind(amount,payerAccount.id,amount));
+      operations.push(env.DB.prepare("INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)").bind(uid(),payerAccount.id,group,'loan_repayment',amount,Number(payerAccount.balance)-amount,`Loan EMI payment for ${loan.loan_number}`));
+    }
+    operations.push(env.DB.prepare("UPDATE demo_loans SET outstanding_amount=?,remaining_months=?,status=?,updated_at=datetime('now') WHERE id=? AND outstanding_amount=? AND status='active'").bind(outstanding,schedule.filter(e=>{const a=allocations.find(x=>x.id===e.id);return a? a.paidAfter<a.amount : e.status!=='paid';}).length,outstanding===0?'closed':'active',loan.id,Number(loan.outstanding_amount)));
+    for(const a of allocations) operations.push(env.DB.prepare("UPDATE loan_emi_schedule SET paid_amount=?,status=?,paid_at=CASE WHEN ?='paid' THEN datetime('now') ELSE paid_at END,transaction_group=? WHERE id=? AND status IN ('pending')").bind(a.paidAfter,a.paidAfter>=a.amount?'paid':'pending',a.paidAfter>=a.amount?'paid':'pending',group,a.id));
+    operations.push(env.DB.prepare("INSERT INTO loan_payment_records(id,idempotency_key,loan_id,loan_number,borrower_user_id,payer_user_id,payer_account_id,payment_method,amount,reference,actor_user_id,allocations_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(paymentId,idem,loan.id,loan.loan_number,loan.user_id,payerAccount?.owner_id||null,payerAccount?.id||null,methodType,amount,reference,user.id,JSON.stringify(allocations)));
+    await env.DB.batch(operations);
+    await postTreasury(env,user,'loan_repayment',amount,`Loan repayment · ${loan.loan_number} · ${methodType}`,'loan_payment',paymentId,group);
+    if(outstanding===0) await env.DB.prepare("UPDATE loan_applications SET status='closed',updated_at=datetime('now') WHERE id=?").bind(loan.application_id).run();
+    await notify(env,loan.user_id,'Loan payment received',`A payment of NVR ${(amount/100).toFixed(2)} was received for loan ${loan.loan_number}. Remaining outstanding: NVR ${(outstanding/100).toFixed(2)}.`);
+    await audit(env,user,'loan_payment_received','demo_loan',loan.id,{loanNumber:loan.loan_number,amount,paymentMethod:methodType,payerUserId:payerAccount?.owner_id||null,reference,allocations});
+    return response({ok:true,reference,loanNumber:loan.loan_number,outstanding,message:`Loan payment received. Reference: ${reference}. Remaining outstanding: NVR ${(outstanding/100).toFixed(2)}.`},200,request);
+  }
+
+  // Branch Counter: account lookup, cash deposit/withdrawal and credit-card collection.
+  if(path.startsWith('/api/branch/')) {
+    if(!(await branchAllowed(user,method,path))) return response({error:'Branch Counter permission required.'},403,request);
+    await ensureBranchOperations(env);
+    if(method==='GET' && path==='/api/branch/account-lookup') {
+      const number=String(url.searchParams.get('accountNumber')||'').trim().toUpperCase();
+      const a=await env.DB.prepare("SELECT a.account_number,a.account_type,a.balance,a.status,a.branch_id,u.display_name,u.username FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=?").bind(number).first();
+      if(!a) return response({error:'Account not found.'},404,request);
+      if(user.staff_branch_id && a.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Account is outside your assigned branch.'},403,request);
+      return response({customer:{name:a.display_name,username:a.username,accountNumber:a.account_number,accountType:a.account_type,balance:a.balance,status:a.status}},200,request);
+    }
+    if(method==='GET' && path==='/api/branch/loan-lookup') {
+      const number=String(url.searchParams.get('loanNumber')||'').trim().toUpperCase();
+      const loan=await env.DB.prepare("SELECT l.loan_number,l.principal_amount,l.outstanding_amount,l.monthly_payment,l.status,u.display_name,a.account_number,a.branch_id FROM demo_loans l JOIN users u ON u.id=l.user_id JOIN accounts a ON a.id=l.account_id WHERE l.loan_number=?").bind(number).first();
+      if(!loan) return response({error:'Loan account not found.'},404,request);
+      if(user.staff_branch_id && loan.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Loan account is outside your assigned branch.'},403,request);
+      return response({loan:{loanNumber:loan.loan_number,borrower:loan.display_name,accountMasked:`••••${String(loan.account_number).slice(-4)}`,principal:loan.principal_amount,outstanding:loan.outstanding_amount,monthlyEmi:loan.monthly_payment,status:loan.status}},200,request);
+    }
+    if(method==='GET' && path==='/api/branch/card-lookup') {
+      await ensureCardColumns(env);
+      const last4=String(url.searchParams.get('last4')||'').replace(/\D/g,'').slice(-4), ownerAccount=String(url.searchParams.get('accountNumber')||'').trim().toUpperCase();
+      if(!/^\d{4}$/.test(last4)||!ownerAccount) return response({error:'Enter card last 4 digits and cardholder account number.'},400,request);
+      const cards=await env.DB.prepare("SELECT c.id,c.masked_number,c.credit_limit,c.outstanding,c.status,u.display_name,a.account_number,a.branch_id FROM virtual_cards c JOIN users u ON u.id=c.user_id JOIN accounts a ON a.user_id=u.id WHERE a.account_number=? AND (substr(replace(COALESCE(c.masked_number,''),' ',''),-4)=? OR substr(COALESCE(c.demo_number,''),-4)=?) ORDER BY c.created_at DESC LIMIT 2").bind(ownerAccount,last4,last4).all();
+      if((cards.results||[]).length!==1) return response({error:cards.results?.length?'More than one card matched. Use the customer account and confirm with the cardholder.':'No matching card found for those details.'},cards.results?.length?409:404,request);
+      const c=cards.results[0]; if(user.staff_branch_id && c.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Card account is outside your assigned branch.'},403,request); return response({card:{id:c.id,cardholder:c.display_name,accountMasked:`••••${ownerAccount.slice(-4)}`,maskedNumber:c.masked_number,creditLimit:c.credit_limit,outstanding:c.outstanding,status:c.status}},200,request);
+    }
+    if(method==='POST' && path==='/api/branch/account-operation') {
+      const d=await body(request),number=String(d.accountNumber||'').trim().toUpperCase(),operation=String(d.operation||'').toLowerCase(),amount=Math.round(Number(d.amount)*100),reason=String(d.reason||'').trim().slice(0,240),idem=String(d.idempotencyKey||'');
+      if(!['deposit','withdrawal'].includes(operation)||!Number.isSafeInteger(amount)||amount<100||reason.length<3||!/^[A-Za-z0-9._:-]{16,100}$/.test(idem)) return response({error:'Enter account, operation, amount, reason and payment reference.'},400,request);
+      const prev=await env.DB.prepare('SELECT reference FROM branch_cash_operations WHERE idempotency_key=?').bind(idem).first(); if(prev)return response({ok:true,alreadyProcessed:true,reference:prev.reference},200,request);
+      const a=await env.DB.prepare("SELECT a.*,u.display_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=? AND a.status='active'").bind(number).first();
+      if(!a)return response({error:'Active customer account not found.'},404,request);
+      if(user.staff_branch_id && a.branch_id!==(user.staff_branch_id||'NB-HQ')) return response({error:'Account is outside your assigned branch.'},403,request);
+      if(operation==='withdrawal'&&Number(a.balance)<amount)return response({error:'Insufficient customer balance.'},409,request);
+      await ensureTreasury(env); const treasury=await env.DB.prepare('SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger').first();
+      if(operation==='deposit'&&Number(treasury?.balance||0)<amount)return response({error:'Insufficient branch cash/Treasury funds for this deposit.'},409,request);
+      const after=operation==='deposit'?Number(a.balance)+amount:Number(a.balance)-amount,reference=`NBC-${crypto.randomUUID().replace(/-/g,'').slice(0,16).toUpperCase()}`,group=uid(),opId=uid();
+      await env.DB.batch([
+        env.DB.prepare('UPDATE accounts SET balance=? WHERE id=? AND balance=? AND status=\'active\'').bind(after,a.id,Number(a.balance)),
+        env.DB.prepare('INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)').bind(uid(),a.id,group,operation,amount,after,`Branch cash ${operation} · ${reason}`),
+        env.DB.prepare('INSERT INTO branch_cash_operations(id,idempotency_key,account_id,actor_user_id,operation,amount,reason,reference) VALUES(?,?,?,?,?,?,?,?)').bind(opId,idem,a.id,user.id,operation,amount,reason,reference)
+      ]);
+      await postTreasury(env,user,operation==='deposit'?'branch_cash_deposit':'branch_cash_withdrawal',operation==='deposit'?-amount:amount,`Branch cash ${operation} · ${a.account_number} · ${reason}`,'branch_cash_operation',opId,group);
+      await notify(env,a.user_id,`Branch ${operation} recorded`,`A branch cash ${operation} of NVR ${(amount/100).toFixed(2)} was recorded. Reference: ${reference}.`);
+      await audit(env,user,`branch_cash_${operation}`,'account',a.id,{amount,reason,reference,branchId:user.staff_branch_id||'NB-HQ'});
+      return response({ok:true,customer:a.display_name,accountNumber:a.account_number,balanceAfter:after,reference,message:`Cash ${operation} completed. New balance: NVR ${(after/100).toFixed(2)}.`},200,request);
+    }
+    if(method==='POST' && path==='/api/branch/card-payment') {
+      await ensureCardColumns(env); await ensureCardTransactions(env); await ensureTreasury(env);
+      const d=await body(request),cardId=String(d.cardId||''),methodType=String(d.paymentMethod||'cash'),amount=Math.round(Number(d.amount)*100),idem=String(d.idempotencyKey||'');
+      if(!['cash','account'].includes(methodType)||!cardId||!Number.isSafeInteger(amount)||amount<100||!/^[A-Za-z0-9._:-]{16,100}$/.test(idem))return response({error:'Enter card, payment method, amount and reference.'},400,request);
+      const prev=await env.DB.prepare('SELECT reference FROM branch_card_payment_records WHERE idempotency_key=?').bind(idem).first();if(prev)return response({ok:true,alreadyProcessed:true,reference:prev.reference},200,request);
+      const card=await env.DB.prepare('SELECT * FROM virtual_cards WHERE id=?').bind(cardId).first();if(!card)return response({error:'Card not found.'},404,request);
+      if(amount>Number(card.outstanding||0))return response({error:'Payment exceeds current card outstanding.'},409,request);
+      let payer=null;
+      if(methodType==='account'){payer=await env.DB.prepare("SELECT a.*,u.id AS owner_id FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=? AND a.status='active'").bind(String(d.payerAccountNumber||'').trim().toUpperCase()).first();if(!payer)return response({error:'Active payer account not found.'},404,request);if(user.staff_branch_id && payer.branch_id!==(user.staff_branch_id||'NB-HQ'))return response({error:'Payer account is outside your assigned branch.'},403,request);if(Number(payer.balance)<amount)return response({error:'Insufficient payer account balance.'},409,request);}
+      const group=uid(),reference=`NBCP-${crypto.randomUUID().replace(/-/g,'').slice(0,16).toUpperCase()}`,recordId=uid(),after=Number(card.outstanding)-amount;
+      const ops=[env.DB.prepare('UPDATE virtual_cards SET outstanding=outstanding-? WHERE id=? AND outstanding>=?').bind(amount,card.id,amount)];
+      if(payer){ops.push(env.DB.prepare('UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?').bind(amount,payer.id,amount));ops.push(env.DB.prepare('INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)').bind(uid(),payer.id,group,'card_bill_payment',amount,Number(payer.balance)-amount,`Branch card bill payment · ${card.masked_number}`));}
+      ops.push(env.DB.prepare('INSERT INTO card_transactions(id,card_id,user_id,transaction_group,type,amount,description) VALUES(?,?,?,?,?,?,?)').bind(uid(),card.id,card.user_id,group,'bill_payment',amount,`Branch bill payment · ${methodType}`));
+      ops.push(env.DB.prepare('INSERT INTO branch_card_payment_records(id,idempotency_key,card_id,card_owner_user_id,payer_user_id,payer_account_id,payment_method,amount,reference,actor_user_id) VALUES(?,?,?,?,?,?,?,?,?,?)').bind(recordId,idem,card.id,card.user_id,payer?.owner_id||null,payer?.id||null,methodType,amount,reference,user.id));
+      await env.DB.batch(ops);
+      await postTreasury(env,user,'card_bill_payment',amount,`Branch credit-card payment · ${card.masked_number} · ${methodType}`,'branch_card_payment',recordId,group);
+      await notify(env,card.user_id,'Credit card payment received',`A branch payment of NVR ${(amount/100).toFixed(2)} was received. Remaining outstanding: NVR ${(after/100).toFixed(2)}.`);
+      await audit(env,user,'branch_card_payment','virtual_card',card.id,{amount,methodType,reference,payerAccount:payer?.account_number||null});
+      return response({ok:true,reference,outstanding:after,message:`Credit card payment received. Remaining outstanding: NVR ${(after/100).toFixed(2)}.`},200,request);
+    }
+    return response({error:'Branch Counter endpoint not found.'},404,request);
+  }
+
   if (method === "POST" && path.startsWith("/api/admin/")) {
     if (!hasStaffPermission(user, method, path)) return response({error:"Insufficient role permission."},403,request);
     const d = await body(request);
