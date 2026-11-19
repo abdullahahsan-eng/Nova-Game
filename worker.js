@@ -308,6 +308,70 @@ async function branchAllowed(user, method, path) {
   if (isSuperAdmin(user)) return true;
   return hasStaffPermission(user, method, path);
 }
+
+async function ensurePayrollTables(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_employees (
+    id TEXT PRIMARY KEY, employee_number TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+    account_id TEXT NOT NULL REFERENCES accounts(id), designation TEXT NOT NULL, department TEXT NOT NULL DEFAULT '',
+    joining_date TEXT NOT NULL, frequency TEXT NOT NULL CHECK(frequency IN ('monthly','weekly')),
+    basic_salary INTEGER NOT NULL CHECK(basic_salary>=0), default_bonus INTEGER NOT NULL DEFAULT 0,
+    default_deductions INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_batches (
+    id TEXT PRIMARY KEY, batch_number TEXT NOT NULL UNIQUE, frequency TEXT NOT NULL CHECK(frequency IN ('monthly','weekly')),
+    period_start TEXT NOT NULL, period_end TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','approved','paid','rejected')),
+    total_amount INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL REFERENCES users(id), approved_by TEXT,
+    approved_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_items (
+    id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES payroll_batches(id), employee_id TEXT NOT NULL REFERENCES payroll_employees(id),
+    basic_salary INTEGER NOT NULL, bonus INTEGER NOT NULL DEFAULT 0, deductions INTEGER NOT NULL DEFAULT 0,
+    advance_adjustment INTEGER NOT NULL DEFAULT 0, net_salary INTEGER NOT NULL CHECK(net_salary>=0),
+    payment_method TEXT NOT NULL CHECK(payment_method IN ('internal','manual')), payment_reference TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid')), paid_at TEXT,
+    UNIQUE(batch_id,employee_id)
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_advances (
+    id TEXT PRIMARY KEY, employee_id TEXT NOT NULL REFERENCES payroll_employees(id), amount INTEGER NOT NULL CHECK(amount>0),
+    outstanding INTEGER NOT NULL CHECK(outstanding>=0), note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_payroll_items_batch ON payroll_items(batch_id)').run();
+}
+
+
+async function ensurePayrollTables(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_employees (
+    id TEXT PRIMARY KEY, employee_number TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+    account_id TEXT NOT NULL REFERENCES accounts(id), designation TEXT NOT NULL, department TEXT NOT NULL DEFAULT '',
+    joining_date TEXT NOT NULL, frequency TEXT NOT NULL CHECK(frequency IN ('monthly','weekly')),
+    basic_salary INTEGER NOT NULL CHECK(basic_salary>=0), default_bonus INTEGER NOT NULL DEFAULT 0,
+    default_deductions INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_batches (
+    id TEXT PRIMARY KEY, batch_number TEXT NOT NULL UNIQUE, frequency TEXT NOT NULL CHECK(frequency IN ('monthly','weekly')),
+    period_start TEXT NOT NULL, period_end TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','approved','paid','rejected')),
+    total_amount INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL REFERENCES users(id), approved_by TEXT,
+    approved_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_items (
+    id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES payroll_batches(id), employee_id TEXT NOT NULL REFERENCES payroll_employees(id),
+    basic_salary INTEGER NOT NULL, bonus INTEGER NOT NULL DEFAULT 0, deductions INTEGER NOT NULL DEFAULT 0,
+    advance_adjustment INTEGER NOT NULL DEFAULT 0, net_salary INTEGER NOT NULL CHECK(net_salary>=0),
+    payment_method TEXT NOT NULL CHECK(payment_method IN ('internal','manual')), payment_reference TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid')), paid_at TEXT,
+    UNIQUE(batch_id,employee_id)
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_advances (
+    id TEXT PRIMARY KEY, employee_id TEXT NOT NULL REFERENCES payroll_employees(id), amount INTEGER NOT NULL CHECK(amount>0),
+    outstanding INTEGER NOT NULL CHECK(outstanding>=0), note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_payroll_items_batch ON payroll_items(batch_id)').run();
+}
+
 async function route(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -425,6 +489,152 @@ async function route(request, env) {
   }
 
   const user = await auth(request, env);
+
+  // Payroll Control Centre: all writes and approvals are Super Admin-only.
+  if (path.startsWith('/api/admin/payroll')) {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    await ensurePayrollTables(env);
+    if (method==='GET' && path==='/api/admin/payroll') {
+      const employees=await env.DB.prepare(`SELECT e.*,u.display_name,u.username,u.email,a.account_number FROM payroll_employees e JOIN users u ON u.id=e.user_id JOIN accounts a ON a.id=e.account_id ORDER BY e.created_at DESC`).all();
+      const batches=await env.DB.prepare(`SELECT b.*,COUNT(i.id) AS employee_count FROM payroll_batches b LEFT JOIN payroll_items i ON i.batch_id=b.id GROUP BY b.id ORDER BY b.created_at DESC LIMIT 100`).all();
+      const advances=await env.DB.prepare(`SELECT x.*,e.employee_number,u.display_name FROM payroll_advances x JOIN payroll_employees e ON e.id=x.employee_id JOIN users u ON u.id=e.user_id ORDER BY x.created_at DESC LIMIT 100`).all();
+      return response({employees:employees.results||[],batches:batches.results||[],advances:advances.results||[]},200,request);
+    }
+    if (method==='POST' && path==='/api/admin/payroll/employees') {
+      const d=await body(request), userId=String(d.userId||''), accountNumber=String(d.accountNumber||'').trim();
+      const account=await env.DB.prepare(`SELECT a.id,a.user_id,a.account_number FROM accounts a WHERE a.account_number=? AND a.status='active'`).bind(accountNumber).first();
+      if(!account || account.user_id!==userId) return response({error:'Choose an active savings account belonging to the selected NovaBank customer.'},400,request);
+      const basic=Math.round(Number(d.basicSalary||0)*100), bonus=Math.round(Number(d.bonus||0)*100), deductions=Math.round(Number(d.deductions||0)*100);
+      if(!Number.isSafeInteger(basic)||basic<0||!String(d.designation||'').trim()||!['monthly','weekly'].includes(d.frequency)) return response({error:'Enter valid employee and salary details.'},400,request);
+      const id=uid(), count=await env.DB.prepare('SELECT COUNT(*) AS n FROM payroll_employees').first(), empNo=`NB-EMP-${String(Number(count?.n||0)+1).padStart(4,'0')}`;
+      try { await env.DB.prepare(`INSERT INTO payroll_employees(id,employee_number,user_id,account_id,designation,department,joining_date,frequency,basic_salary,default_bonus,default_deductions) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(id,empNo,userId,account.id,String(d.designation).slice(0,80),String(d.department||'').slice(0,80),String(d.joiningDate||new Date().toISOString().slice(0,10)),d.frequency,basic,bonus,deductions).run(); }
+      catch(e){return response({error:'Employee already registered or details are invalid.'},409,request)}
+      await audit(env,user,'payroll_employee_created','payroll_employee',id,{employeeNumber:empNo,userId,accountNumber});
+      return response({ok:true,employeeNumber:empNo,message:`Employee ${empNo} added to payroll directory.`},201,request);
+    }
+    if (method==='POST' && path==='/api/admin/payroll/batches') {
+      const d=await body(request), frequency=String(d.frequency||''), start=String(d.periodStart||''), end=String(d.periodEnd||'');
+      if(!['monthly','weekly'].includes(frequency)||!/^\d{4}-\d{2}-\d{2}$/.test(start)||!/^\d{4}-\d{2}-\d{2}$/.test(end)||end<start) return response({error:'Enter a valid payroll frequency and period.'},400,request);
+      const rows=await env.DB.prepare("SELECT * FROM payroll_employees WHERE status='active' AND frequency=? ORDER BY employee_number").bind(frequency).all();
+      if(!(rows.results||[]).length) return response({error:`No active ${frequency} employees found.`},400,request);
+      const id=uid(), batchNo=`NB-PAY-${new Date().getFullYear()}-${id.slice(0,8).toUpperCase()}`;
+      const statements=[env.DB.prepare(`INSERT INTO payroll_batches(id,batch_number,frequency,period_start,period_end,total_amount,created_by) VALUES(?,?,?,?,?,?,?)`).bind(id,batchNo,frequency,start,end,0,user.id)];
+      let total=0;
+      for(const e of rows.results){const net=Number(e.basic_salary)+Number(e.default_bonus)-Number(e.default_deductions);if(net<0)return response({error:`Invalid salary structure for ${e.employee_number}.`},400,request);total+=net;statements.push(env.DB.prepare(`INSERT INTO payroll_items(id,batch_id,employee_id,basic_salary,bonus,deductions,advance_adjustment,net_salary,payment_method) VALUES(?,?,?,?,?,?,?,?, 'internal')`).bind(uid(),id,e.id,e.basic_salary,e.default_bonus,e.default_deductions,0,net));}
+      statements[0]=env.DB.prepare(`INSERT INTO payroll_batches(id,batch_number,frequency,period_start,period_end,total_amount,created_by) VALUES(?,?,?,?,?,?,?)`).bind(id,batchNo,frequency,start,end,total,user.id);
+      await env.DB.batch(statements); await audit(env,user,'payroll_batch_created','payroll_batch',id,{batchNumber:batchNo,total,employees:rows.results.length,frequency});
+      return response({ok:true,batchNumber:batchNo,message:`Draft payroll batch created for ${rows.results.length} employees. Review payment methods and references before approval.`},201,request);
+    }
+    const batchMatch=path.match(/^\/api\/admin\/payroll\/batches\/([^/]+)\/(approve|reject)$/);
+    if(batchMatch && method==='POST'){
+      const batch=await env.DB.prepare("SELECT * FROM payroll_batches WHERE id=? AND status='draft'").bind(batchMatch[1]).first();
+      if(!batch)return response({error:'Draft payroll batch not found.'},404,request);
+      const d=await body(request), items=await env.DB.prepare(`SELECT i.*,e.employee_number,e.account_id,e.user_id,a.account_number FROM payroll_items i JOIN payroll_employees e ON e.id=i.employee_id JOIN accounts a ON a.id=e.account_id WHERE i.batch_id=? ORDER BY e.employee_number`).bind(batch.id).all();
+      if(batchMatch[2]==='reject'){await env.DB.prepare("UPDATE payroll_batches SET status='rejected',approved_by=?,approved_at=datetime('now') WHERE id=? AND status='draft'").bind(user.id,batch.id).run();await audit(env,user,'payroll_batch_rejected','payroll_batch',batch.id,{note:String(d.note||'').slice(0,240)});return response({ok:true,message:'Payroll batch rejected; no payments were made.'},200,request)}
+      if(!items.results?.length)return response({error:'Payroll batch has no employees.'},400,request);
+      const total=items.results.reduce((n,x)=>n+Number(x.net_salary),0);
+      await ensureTreasury(env);const treasury=await env.DB.prepare('SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger').first();
+      if(Number(treasury?.balance||0)<total)return response({error:'Insufficient Treasury funds. Payroll approval was blocked.'},409,request);
+      const statements=[];const group=uid();
+      for(const it of items.results){if(it.payment_method==='manual'&&!String(it.payment_reference||'').trim())return response({error:`Add an external payment reference for ${it.employee_number}.`},400,request);
+        if(it.payment_method==='internal'){
+          const acc=await env.DB.prepare("SELECT balance FROM accounts WHERE id=? AND status='active'").bind(it.account_id).first();if(!acc)return response({error:`Linked employee account unavailable: ${it.employee_number}.`},409,request);
+          statements.push(env.DB.prepare('UPDATE accounts SET balance=balance+? WHERE id=?').bind(it.net_salary,it.account_id));
+          statements.push(env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),it.account_id,group,'salary_credit',it.net_salary,Number(acc.balance)+Number(it.net_salary),`NovaBank payroll ${batch.batch_number}`));
+        }
+        statements.push(env.DB.prepare("UPDATE payroll_items SET status='paid',paid_at=datetime('now') WHERE id=? AND status='pending'").bind(it.id));
+      }
+      statements.push(env.DB.prepare("UPDATE payroll_batches SET status='paid',approved_by=?,approved_at=datetime('now') WHERE id=? AND status='draft'").bind(user.id,batch.id));
+      await env.DB.batch(statements);
+      await postTreasury(env,user,'payroll_expense',-total,`Payroll batch ${batch.batch_number}`,'payroll_batch',batch.id,group);
+      for(const it of items.results){await notify(env,it.user_id,'Salary credited',`Your NovaBank demo payroll for ${batch.period_start} to ${batch.period_end} has been processed. Batch: ${batch.batch_number}.`)}
+      await audit(env,user,'payroll_batch_paid','payroll_batch',batch.id,{batchNumber:batch.batch_number,total,employees:items.results.length});
+      return response({ok:true,message:`Payroll batch ${batch.batch_number} marked paid.`},200,request);
+    }
+    return response({error:'Payroll route not found.'},404,request);
+  }
+
+  // Payroll Control Centre: all writes and approvals are Super Admin-only.
+  if (path.startsWith('/api/admin/payroll')) {
+    if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
+    await ensurePayrollTables(env);
+    if (method==='GET' && path==='/api/admin/payroll') {
+      const employees=await env.DB.prepare(`SELECT e.*,u.display_name,u.username,u.email,a.account_number FROM payroll_employees e JOIN users u ON u.id=e.user_id JOIN accounts a ON a.id=e.account_id ORDER BY e.created_at DESC`).all();
+      const batches=await env.DB.prepare(`SELECT b.*,COUNT(i.id) AS employee_count FROM payroll_batches b LEFT JOIN payroll_items i ON i.batch_id=b.id GROUP BY b.id ORDER BY b.created_at DESC LIMIT 100`).all();
+      const advances=await env.DB.prepare(`SELECT x.*,e.employee_number,u.display_name FROM payroll_advances x JOIN payroll_employees e ON e.id=x.employee_id JOIN users u ON u.id=e.user_id ORDER BY x.created_at DESC LIMIT 100`).all();
+      return response({employees:employees.results||[],batches:batches.results||[],advances:advances.results||[]},200,request);
+    }
+    if (method==='POST' && path==='/api/admin/payroll/employees') {
+      const d=await body(request), userId=String(d.userId||''), accountNumber=String(d.accountNumber||'').trim();
+      const account=await env.DB.prepare(`SELECT a.id,a.user_id,a.account_number FROM accounts a WHERE a.account_number=? AND a.status='active'`).bind(accountNumber).first();
+      if(!account || account.user_id!==userId) return response({error:'Choose an active savings account belonging to the selected NovaBank customer.'},400,request);
+      const basic=Math.round(Number(d.basicSalary||0)*100), bonus=Math.round(Number(d.bonus||0)*100), deductions=Math.round(Number(d.deductions||0)*100);
+      if(!Number.isSafeInteger(basic)||basic<0||!String(d.designation||'').trim()||!['monthly','weekly'].includes(d.frequency)) return response({error:'Enter valid employee and salary details.'},400,request);
+      const id=uid(), count=await env.DB.prepare('SELECT COUNT(*) AS n FROM payroll_employees').first(), empNo=`NB-EMP-${String(Number(count?.n||0)+1).padStart(4,'0')}`;
+      try { await env.DB.prepare(`INSERT INTO payroll_employees(id,employee_number,user_id,account_id,designation,department,joining_date,frequency,basic_salary,default_bonus,default_deductions) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(id,empNo,userId,account.id,String(d.designation).slice(0,80),String(d.department||'').slice(0,80),String(d.joiningDate||new Date().toISOString().slice(0,10)),d.frequency,basic,bonus,deductions).run(); }
+      catch(e){return response({error:'Employee already registered or details are invalid.'},409,request)}
+      await audit(env,user,'payroll_employee_created','payroll_employee',id,{employeeNumber:empNo,userId,accountNumber});
+      return response({ok:true,employeeNumber:empNo,message:`Employee ${empNo} added to payroll directory.`},201,request);
+    }
+    if (method==='POST' && path==='/api/admin/payroll/batches') {
+      const d=await body(request), frequency=String(d.frequency||''), start=String(d.periodStart||''), end=String(d.periodEnd||'');
+      if(!['monthly','weekly'].includes(frequency)||!/^\d{4}-\d{2}-\d{2}$/.test(start)||!/^\d{4}-\d{2}-\d{2}$/.test(end)||end<start) return response({error:'Enter a valid payroll frequency and period.'},400,request);
+      const rows=await env.DB.prepare("SELECT * FROM payroll_employees WHERE status='active' AND frequency=? ORDER BY employee_number").bind(frequency).all();
+      if(!(rows.results||[]).length) return response({error:`No active ${frequency} employees found.`},400,request);
+      const id=uid(), batchNo=`NB-PAY-${new Date().getFullYear()}-${id.slice(0,8).toUpperCase()}`;
+      const statements=[env.DB.prepare(`INSERT INTO payroll_batches(id,batch_number,frequency,period_start,period_end,total_amount,created_by) VALUES(?,?,?,?,?,?,?)`).bind(id,batchNo,frequency,start,end,0,user.id)];
+      let total=0;
+      for(const e of rows.results){const net=Number(e.basic_salary)+Number(e.default_bonus)-Number(e.default_deductions);if(net<0)return response({error:`Invalid salary structure for ${e.employee_number}.`},400,request);total+=net;statements.push(env.DB.prepare(`INSERT INTO payroll_items(id,batch_id,employee_id,basic_salary,bonus,deductions,advance_adjustment,net_salary,payment_method) VALUES(?,?,?,?,?,?,?,?, 'internal')`).bind(uid(),id,e.id,e.basic_salary,e.default_bonus,e.default_deductions,0,net));}
+      statements[0]=env.DB.prepare(`INSERT INTO payroll_batches(id,batch_number,frequency,period_start,period_end,total_amount,created_by) VALUES(?,?,?,?,?,?,?)`).bind(id,batchNo,frequency,start,end,total,user.id);
+      await env.DB.batch(statements); await audit(env,user,'payroll_batch_created','payroll_batch',id,{batchNumber:batchNo,total,employees:rows.results.length,frequency});
+      return response({ok:true,batchNumber:batchNo,message:`Draft payroll batch created for ${rows.results.length} employees. Review payment methods and references before approval.`},201,request);
+    }
+    const batchDetail=path.match(/^\/api\/admin\/payroll\/batches\/([^/]+)$/);
+    if(batchDetail && method==='GET'){
+      const batch=await env.DB.prepare('SELECT * FROM payroll_batches WHERE id=?').bind(batchDetail[1]).first();
+      if(!batch)return response({error:'Payroll batch not found.'},404,request);
+      const items=await env.DB.prepare(`SELECT i.*,e.employee_number,u.display_name,a.account_number FROM payroll_items i JOIN payroll_employees e ON e.id=i.employee_id JOIN users u ON u.id=e.user_id JOIN accounts a ON a.id=e.account_id WHERE i.batch_id=? ORDER BY e.employee_number`).bind(batch.id).all();
+      return response({batch,items:items.results||[]},200,request);
+    }
+    const itemMatch=path.match(/^\/api\/admin\/payroll\/items\/([^/]+)$/);
+    if(itemMatch && method==='PATCH'){
+      const d=await body(request), methodType=String(d.paymentMethod||'');
+      if(!['internal','manual'].includes(methodType))return response({error:'Choose internal or manual payment.'},400,request);
+      const item=await env.DB.prepare(`SELECT i.id,b.status FROM payroll_items i JOIN payroll_batches b ON b.id=i.batch_id WHERE i.id=?`).bind(itemMatch[1]).first();
+      if(!item||item.status!=='draft')return response({error:'Only items in a draft batch can be edited.'},404,request);
+      const ref=String(d.reference||'').trim().slice(0,120);if(methodType==='manual'&&!ref)return response({error:'External payment reference is required.'},400,request);
+      await env.DB.prepare('UPDATE payroll_items SET payment_method=?,payment_reference=? WHERE id=?').bind(methodType,ref,item.id).run();
+      await audit(env,user,'payroll_payment_method_updated','payroll_item',item.id,{paymentMethod:methodType,reference:ref});
+      return response({ok:true},200,request);
+    }
+    const batchMatch=path.match(/^\/api\/admin\/payroll\/batches\/([^/]+)\/(approve|reject)$/);
+    if(batchMatch && method==='POST'){
+      const batch=await env.DB.prepare("SELECT * FROM payroll_batches WHERE id=? AND status='draft'").bind(batchMatch[1]).first();
+      if(!batch)return response({error:'Draft payroll batch not found.'},404,request);
+      const d=await body(request), items=await env.DB.prepare(`SELECT i.*,e.employee_number,e.account_id,e.user_id,a.account_number FROM payroll_items i JOIN payroll_employees e ON e.id=i.employee_id JOIN accounts a ON a.id=e.account_id WHERE i.batch_id=? ORDER BY e.employee_number`).bind(batch.id).all();
+      if(batchMatch[2]==='reject'){await env.DB.prepare("UPDATE payroll_batches SET status='rejected',approved_by=?,approved_at=datetime('now') WHERE id=? AND status='draft'").bind(user.id,batch.id).run();await audit(env,user,'payroll_batch_rejected','payroll_batch',batch.id,{note:String(d.note||'').slice(0,240)});return response({ok:true,message:'Payroll batch rejected; no payments were made.'},200,request)}
+      if(!items.results?.length)return response({error:'Payroll batch has no employees.'},400,request);
+      const total=items.results.reduce((n,x)=>n+Number(x.net_salary),0);
+      await ensureTreasury(env);const treasury=await env.DB.prepare('SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger').first();
+      if(Number(treasury?.balance||0)<total)return response({error:'Insufficient Treasury funds. Payroll approval was blocked.'},409,request);
+      const statements=[];const group=uid();
+      for(const it of items.results){if(it.payment_method==='manual'&&!String(it.payment_reference||'').trim())return response({error:`Add an external payment reference for ${it.employee_number}.`},400,request);
+        if(it.payment_method==='internal'){
+          const acc=await env.DB.prepare("SELECT balance FROM accounts WHERE id=? AND status='active'").bind(it.account_id).first();if(!acc)return response({error:`Linked employee account unavailable: ${it.employee_number}.`},409,request);
+          statements.push(env.DB.prepare('UPDATE accounts SET balance=balance+? WHERE id=?').bind(it.net_salary,it.account_id));
+          statements.push(env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),it.account_id,group,'salary_credit',it.net_salary,Number(acc.balance)+Number(it.net_salary),`NovaBank payroll ${batch.batch_number}`));
+        }
+        statements.push(env.DB.prepare("UPDATE payroll_items SET status='paid',paid_at=datetime('now') WHERE id=? AND status='pending'").bind(it.id));
+      }
+      statements.push(env.DB.prepare("UPDATE payroll_batches SET status='paid',approved_by=?,approved_at=datetime('now') WHERE id=? AND status='draft'").bind(user.id,batch.id));
+      await env.DB.batch(statements);
+      await postTreasury(env,user,'payroll_expense',-total,`Payroll batch ${batch.batch_number}`,'payroll_batch',batch.id,group);
+      for(const it of items.results){await notify(env,it.user_id,'Salary credited',`Your NovaBank demo payroll for ${batch.period_start} to ${batch.period_end} has been processed. Batch: ${batch.batch_number}.`)}
+      await audit(env,user,'payroll_batch_paid','payroll_batch',batch.id,{batchNumber:batch.batch_number,total,employees:items.results.length});
+      return response({ok:true,message:`Payroll batch ${batch.batch_number} marked paid.`},200,request);
+    }
+    return response({error:'Payroll route not found.'},404,request);
+  }
 
   // Staff directory and role assignments are Super Admin-only.
   if (path === '/api/admin/staff' && method === 'GET') {

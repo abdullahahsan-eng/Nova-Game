@@ -1,31 +1,51 @@
-# NovaBank queue and card lifecycle patch
+# NovaBank v8.0.0 – Staff Banking & Payroll Edition
 
-## What changed
-- Super Admin application lists normalize nullable DOM collections and use a cache-busted admin script URL (`admin-v21`).
-- Loan/card active queues show only pending, need-documents, and verified applications.
-- Existing approved/rejected applications with no archive timestamp are soft-archived automatically; rows are retained.
-- The archive endpoint continues to show the original application records and decision notes.
-- Card approval now creates a schema-valid `active` virtual card with `activation_pending=1` instead of writing the unsupported `inactive` status.
-- Card activation uses `activation_pending` and records the existing N₹500 demo joining fee once.
-- Pending-activation cards are excluded from card purchases, card transfers, and card-control actions.
-- Customer portal shows the approved card and its activation action.
-- Service worker cache version is bumped to v4 so the updated customer app can be fetched.
+## Base retained
+This release is built on the uploaded NovaBank Super Admin Portal v7 package. Existing customer portal, account, loan, card, ledger, Treasury, branch counter, staff/security and application workflows are retained.
+
+## Added in v8.0.0
+- Super Admin Payroll Control Centre.
+- Employee directory linked to an existing NovaBank customer user and that customer's active account. Employee numbers are generated as `NB-EMP-0001` style identifiers.
+- Monthly and weekly employee salary frequency.
+- Salary structure fields for basic salary, default bonus/incentives and deductions. All money is stored in the existing minor-unit convention (100 units = N₹1.00).
+- Draft payroll batches with period dates, employee count and total net salary.
+- Per-employee payment method selection: internal NovaBank account transfer or manual/external payment reference.
+- Super Admin-only approval or rejection. Approval checks the current Treasury balance, records internal salary credits in the customer's existing account ledger, marks payroll items paid, posts payroll expense to Treasury, sends employee notifications and writes audit events.
+- Version footer in Customer, Super Admin and Branch Counter portals.
+- Additive runtime D1 tables: `payroll_employees`, `payroll_batches`, `payroll_items`, `payroll_advances`. Existing tables and records are not dropped or reset.
+
+## Important scope limitations
+This is the first payroll foundation, not the complete HR/staff self-service suite. It does **not** yet include a separate employee login/portal, HR-generated employee customer-account application/approval flow, attendance, downloadable payslips, advance creation/adjustment workflow, or full payroll reversal/correction workflow. The advances table is reserved but no advance-entry UI is enabled. Do not treat the presence of that table as an implemented feature.
+
+Employee registration currently requires a verified existing customer User ID and active account number. The employee remains a customer identity for account credit; this release does not issue separate employee credentials.
 
 ## Data safety
-- No D1 database is dropped, recreated, or reset.
-- No customer, account, balance, ledger, transaction, or application rows are deleted.
-- Archive behavior uses `deleted_at` soft-archiving only.
-- The Worker adds missing compatibility columns using `ensureColumn` and performs a small in-place migration for legacy final decisions and legacy inactive cards.
+- Do not create, rename, reset, or replace the existing D1 database.
+- Keep the existing `wrangler.toml`, D1 database binding, secrets and environment settings.
+- Payroll tables are created additively when the Super Admin opens Payroll Control Centre.
+- Existing customer balances and transaction history are not intentionally migrated or rewritten.
+- Internal salary payments credit the employee's existing NovaBank account. Manual/external payments only record an external reference and do not credit the employee's NovaBank account.
+- Treasury payroll expense is recorded as a negative Treasury movement; Treasury funds are checked before execution.
 
-## Deploy
-1. Review the changed files in this ZIP.
-2. Replace the matching files in your repository, preserving any newer unrelated work.
-3. Deploy the Worker using your existing Cloudflare configuration and D1 binding.
-4. Deploy the Pages/static assets as you currently do.
-5. Hard refresh the Super Admin page (Ctrl+Shift+R), then reopen Loan & Card Requests.
-6. Test with a demo customer/application before using the workflow broadly.
+## Files in this patch
+- `worker.js`
+- `public/admin.html`
+- `public/admin.js`
+- `public/index.html`
+- `public/branch.html`
+- `README.md`
 
 ## Validation performed
-- `node --check` passed for `worker.js`, `public/admin.js`, and `public/app.js`.
-- SQLite smoke test passed against `schema.sql` for legacy archive migration, card approval insert, and one-time activation state transition.
-- Live Cloudflare/D1 integration was not available in this workspace, so deployment and authenticated end-to-end behavior still need to be verified in your account.
+- `node --check worker.js` passed.
+- `node --check public/admin.js` passed.
+- `node --check public/branch.js` passed (unchanged file).
+- Existing `schema.sql` and the new payroll table definitions executed successfully in an in-memory SQLite smoke test.
+- Live Cloudflare Worker/D1 authenticated end-to-end testing was not available. Test on a backup/test deployment and a demo employee before production-like use.
+
+## Deploy carefully
+1. Back up the current repository and confirm the D1 database backup/export.
+2. Replace only the listed files in your existing repository. Keep `schema.sql`, `wrangler.toml`, database ID/binding, secrets, and all other assets unless you intentionally merge other work.
+3. Deploy the Worker and static assets using your existing deployment process.
+4. Sign in to Super Admin and open Payroll Control.
+5. Register a test employee using a test customer's User ID and active account number. Create a small draft batch and inspect the payment method/reference before approving.
+6. Confirm the test customer's account ledger, Treasury history, notification and audit event. Never test by resetting the live D1 database.
