@@ -25,8 +25,9 @@ const STAFF_ROLES = new Set(['branch_manager','loan_officer','credit_officer','c
 async function ensureSecurityTables(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
   await env.DB.prepare("INSERT OR IGNORE INTO branches(id,name,status) VALUES('NB-HQ','NovaBank Head Office','active')").run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS staff_roles (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, role_name TEXT NOT NULL CHECK(role_name IN ('branch_manager','loan_officer','credit_officer','cashier','auditor')), branch_id TEXT REFERENCES branches(id), is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')), created_by TEXT REFERENCES users(id))`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS staff_roles (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, role_name TEXT NOT NULL CHECK(role_name IN ('branch_manager','loan_officer','credit_officer','cashier','auditor')), branch_id TEXT REFERENCES branches(id), is_active INTEGER NOT NULL DEFAULT 1, permissions_json TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')), created_by TEXT REFERENCES users(id))`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS auth_rate_limits (rate_key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
+  await ensureColumn(env, 'staff_roles', 'permissions_json', 'TEXT');
   await ensureColumn(env, 'accounts', 'branch_id', "TEXT NOT NULL DEFAULT 'NB-HQ'");
   await ensureColumn(env, 'users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
   await env.DB.prepare("UPDATE accounts SET branch_id='NB-HQ' WHERE branch_id IS NULL OR branch_id='' ").run();
@@ -35,9 +36,28 @@ async function ensureSecurityTables(env) {
 }
 function isSuperAdmin(user) { return !!user && user.role === 'admin'; }
 function staffRole(user) { return user?.role || 'customer'; }
+
+const STAFF_PERMISSION_KEYS = ['customer_lookup','cash_operations','loan_collection','card_collection','loan_review','card_review','money_requests','audit_view'];
+function permissionKey(method,path){const m=method.toUpperCase();
+ if(path==='/api/admin/customers'&&m==='GET'||path==='/api/admin/customer-details'&&m==='GET'||path==='/api/branch/account-lookup'&&m==='GET')return 'customer_lookup';
+ if(path==='/api/branch/account-operation'&&m==='POST')return 'cash_operations';
+ if(path==='/api/branch/loan-lookup'&&m==='GET'||path==='/api/branch/loan-payment'&&m==='POST')return 'loan_collection';
+ if(path==='/api/branch/card-lookup'&&m==='GET'||path==='/api/branch/card-payment'&&m==='POST')return 'card_collection';
+ if(/^\/api\/admin\/loans\/[^/]+\/review$/.test(path))return 'loan_review';
+ if(/^\/api\/admin\/cards\/[^/]+\/review$/.test(path)||path==='/api/admin/card-control-requests'&&m==='GET')return 'card_review';
+ if(path==='/api/admin/money-requests'&&m==='GET'||/^\/api\/admin\/money-requests\/[^/]+\/(review|archive)$/.test(path))return 'money_requests';
+ if(path==='/api/admin/audit'&&m==='GET'||path==='/api/transactions'&&m==='GET')return 'audit_view';
+ return null;
+}
+
 function hasStaffPermission(user, method, path) {
   if (!user || isSuperAdmin(user)) return isSuperAdmin(user);
   const r = staffRole(user), m = method.toUpperCase();
+  let custom=[]; try { custom=JSON.parse(user.staff_permissions_json||'[]'); } catch (_) { custom=[]; }
+  if (user.staff_permissions_json !== null && user.staff_permissions_json !== undefined) {
+    const key = permissionKey(method,path);
+    return !!key && custom.includes(key);
+  }
   const match = (re, methods) => methods.includes(m) && re.test(path);
   if (r === 'branch_manager') return (
     match(/^\/api\/admin\/customers$/, ['GET']) || match(/^\/api\/admin\/customer-details$/, ['GET']) ||
@@ -66,7 +86,7 @@ async function auth(request, env) {
   if (!token) return null;
   const tokenHash = await digest(token);
   const row = await env.DB.prepare(
-    `SELECT u.id,u.username,u.display_name,u.email,COALESCE(sr.role_name,u.role) AS role,u.role AS base_role,u.status,u.must_change_password,s.expires_at,s.created_at AS session_created_at,sr.branch_id AS staff_branch_id,sr.is_active AS staff_active
+    `SELECT u.id,u.username,u.display_name,u.email,COALESCE(sr.role_name,u.role) AS role,u.role AS base_role,u.status,u.must_change_password,s.expires_at,s.created_at AS session_created_at,sr.branch_id AS staff_branch_id,sr.is_active AS staff_active,sr.permissions_json AS staff_permissions_json
      FROM sessions s JOIN users u ON u.id=s.user_id LEFT JOIN staff_roles sr ON sr.user_id=u.id WHERE s.token_hash=?`
   ).bind(tokenHash).first();
   if (!row) return null;
@@ -409,7 +429,7 @@ async function route(request, env) {
   // Staff directory and role assignments are Super Admin-only.
   if (path === '/api/admin/staff' && method === 'GET') {
     if (!isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
-    const rows = await env.DB.prepare(`SELECT u.id,u.username,u.display_name,u.email,u.status,sr.role_name,sr.branch_id,sr.is_active,sr.created_at FROM staff_roles sr JOIN users u ON u.id=sr.user_id ORDER BY sr.created_at DESC`).all();
+    const rows = await env.DB.prepare(`SELECT u.id,u.username,u.display_name,u.email,u.status,sr.role_name,sr.branch_id,sr.is_active,sr.permissions_json,sr.created_at FROM staff_roles sr JOIN users u ON u.id=sr.user_id ORDER BY sr.created_at DESC`).all();
     const branches = await env.DB.prepare("SELECT id,name,status FROM branches ORDER BY name").all();
     return response({staff:rows.results||[],branches:branches.results||[]},200,request);
   }
@@ -448,7 +468,7 @@ async function route(request, env) {
     try {
       await env.DB.batch([
         env.DB.prepare("INSERT INTO users(id,username,display_name,email,password_hash,password_salt,role,status) VALUES(?,?,?,?,?,?,'admin','active')").bind(id,username,displayName,email,hash,salt),
-        env.DB.prepare("INSERT INTO staff_roles(user_id,role_name,branch_id,is_active,created_by) VALUES(?,?,?,1,?)").bind(id,role,branchId,user.id)
+        env.DB.prepare("INSERT INTO staff_roles(user_id,role_name,branch_id,is_active,permissions_json,created_by) VALUES(?,?,?,1,?,?)").bind(id,role,branchId,JSON.stringify(Array.isArray(d.permissions)?d.permissions.filter(x=>STAFF_PERMISSION_KEYS.includes(x)):[]),user.id)
       ]);
       await audit(env,user,'staff_created','staff_user',id,{username,role,branchId});
       return response({ok:true,message:'Staff account created. Share the initial password securely.'},201,request);
@@ -476,7 +496,8 @@ async function route(request, env) {
     if (!STAFF_ROLES.has(role)) return response({error:'Invalid staff role.'},400,request);
     const branch=await env.DB.prepare("SELECT id FROM branches WHERE id=? AND status='active'").bind(branchId).first();
     if (role==='branch_manager'&&!branch) return response({error:'Select an active branch.'},400,request);
-    await env.DB.prepare("UPDATE staff_roles SET role_name=?,branch_id=?,is_active=?,updated_at=datetime('now') WHERE user_id=?").bind(role,branchId,active,staffMatch[1]).run();
+    const permissions=Array.isArray(d.permissions)?JSON.stringify(d.permissions.filter(x=>STAFF_PERMISSION_KEYS.includes(x))):target.permissions_json||'[]';
+    await env.DB.prepare("UPDATE staff_roles SET role_name=?,branch_id=?,is_active=?,permissions_json=?,updated_at=datetime('now') WHERE user_id=?").bind(role,branchId,active,permissions,staffMatch[1]).run();
     if (!active) await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(staffMatch[1]).run();
     await audit(env,user,active?'staff_role_updated':'staff_access_revoked','staff_user',staffMatch[1],{role,active,branchId});
     return response({ok:true,message:active?'Staff permissions updated.':'Staff access disabled and sessions revoked.'},200,request);
