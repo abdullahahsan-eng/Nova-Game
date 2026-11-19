@@ -341,36 +341,6 @@ async function ensurePayrollTables(env) {
 }
 
 
-async function ensurePayrollTables(env) {
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_employees (
-    id TEXT PRIMARY KEY, employee_number TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL UNIQUE REFERENCES users(id),
-    account_id TEXT NOT NULL REFERENCES accounts(id), designation TEXT NOT NULL, department TEXT NOT NULL DEFAULT '',
-    joining_date TEXT NOT NULL, frequency TEXT NOT NULL CHECK(frequency IN ('monthly','weekly')),
-    basic_salary INTEGER NOT NULL CHECK(basic_salary>=0), default_bonus INTEGER NOT NULL DEFAULT 0,
-    default_deductions INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive')),
-    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_batches (
-    id TEXT PRIMARY KEY, batch_number TEXT NOT NULL UNIQUE, frequency TEXT NOT NULL CHECK(frequency IN ('monthly','weekly')),
-    period_start TEXT NOT NULL, period_end TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','approved','paid','rejected')),
-    total_amount INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL REFERENCES users(id), approved_by TEXT,
-    approved_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_items (
-    id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES payroll_batches(id), employee_id TEXT NOT NULL REFERENCES payroll_employees(id),
-    basic_salary INTEGER NOT NULL, bonus INTEGER NOT NULL DEFAULT 0, deductions INTEGER NOT NULL DEFAULT 0,
-    advance_adjustment INTEGER NOT NULL DEFAULT 0, net_salary INTEGER NOT NULL CHECK(net_salary>=0),
-    payment_method TEXT NOT NULL CHECK(payment_method IN ('internal','manual')), payment_reference TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid')), paid_at TEXT,
-    UNIQUE(batch_id,employee_id)
-  )`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_advances (
-    id TEXT PRIMARY KEY, employee_id TEXT NOT NULL REFERENCES payroll_employees(id), amount INTEGER NOT NULL CHECK(amount>0),
-    outstanding INTEGER NOT NULL CHECK(outstanding>=0), note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-  )`).run();
-  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_payroll_items_batch ON payroll_items(batch_id)').run();
-}
 
 async function route(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
