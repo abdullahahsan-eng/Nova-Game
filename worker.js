@@ -337,6 +337,14 @@ async function ensurePayrollTables(env) {
     outstanding INTEGER NOT NULL CHECK(outstanding>=0), note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS payroll_compensation_history (
+    id TEXT PRIMARY KEY, employee_id TEXT NOT NULL REFERENCES payroll_employees(id),
+    basic_salary INTEGER NOT NULL, default_bonus INTEGER NOT NULL DEFAULT 0,
+    default_deductions INTEGER NOT NULL DEFAULT 0, effective_date TEXT NOT NULL,
+    reason TEXT NOT NULL, changed_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_payroll_comp_history_employee ON payroll_compensation_history(employee_id,created_at)').run();
+  await env.DB.prepare(`INSERT INTO payroll_compensation_history(id,employee_id,basic_salary,default_bonus,default_deductions,effective_date,reason,changed_by) SELECT lower(hex(randomblob(16))),e.id,e.basic_salary,e.default_bonus,e.default_deductions,e.joining_date,'Opening salary structure at compensation-history migration','system' FROM payroll_employees e WHERE NOT EXISTS (SELECT 1 FROM payroll_compensation_history h WHERE h.employee_id=e.id)`).run();
   await ensureColumn(env,'payroll_employees','archived_at','TEXT');
   await ensureColumn(env,'payroll_employees','archived_by','TEXT');
   await ensureColumn(env,'payroll_advances','requested_amount','INTEGER NOT NULL DEFAULT 0');
@@ -514,7 +522,8 @@ async function route(request, env) {
       const batches=await env.DB.prepare(`SELECT b.*,COUNT(i.id) AS employee_count FROM payroll_batches b LEFT JOIN payroll_items i ON i.batch_id=b.id GROUP BY b.id ORDER BY b.created_at DESC LIMIT 100`).all();
       const advances=await env.DB.prepare(`SELECT x.*,e.employee_number,u.display_name FROM payroll_advances x JOIN payroll_employees e ON e.id=x.employee_id JOIN users u ON u.id=e.user_id ORDER BY x.created_at DESC LIMIT 100`).all();
       const payslips=await env.DB.prepare(`SELECT p.id,p.payslip_number,p.created_at,e.employee_number,u.display_name FROM payroll_payslips p JOIN payroll_employees e ON e.id=p.employee_id JOIN users u ON u.id=e.user_id ORDER BY p.created_at DESC LIMIT 100`).all();
-      return response({employees:employees.results||[],batches:batches.results||[],advances:advances.results||[],payslips:payslips.results||[]},200,request);
+      const compensation=await env.DB.prepare(`SELECT h.*,e.employee_number,u.display_name FROM payroll_compensation_history h JOIN payroll_employees e ON e.id=h.employee_id JOIN users u ON u.id=e.user_id ORDER BY h.created_at DESC LIMIT 100`).all();
+      return response({employees:employees.results||[],batches:batches.results||[],advances:advances.results||[],payslips:payslips.results||[],compensation:compensation.results||[]},200,request);
     }
     if (method==='POST' && path==='/api/admin/payroll/employees') {
       const d=await body(request), userId=String(d.userId||''), accountNumber=String(d.accountNumber||'').trim();
@@ -527,6 +536,26 @@ async function route(request, env) {
       catch(e){return response({error:'Employee already registered or details are invalid.'},409,request)}
       await audit(env,user,'payroll_employee_created','payroll_employee',id,{employeeNumber:empNo,userId,accountNumber});
       return response({ok:true,employeeNumber:empNo,message:`Employee ${empNo} added to payroll directory.`},201,request);
+    }
+    const compensationMatch=path.match(/^\/api\/admin\/payroll\/employees\/([^/]+)\/compensation$/);
+    if(compensationMatch && method==='POST'){
+      const target=await env.DB.prepare('SELECT * FROM payroll_employees WHERE id=?').bind(compensationMatch[1]).first();
+      if(!target)return response({error:'Employee not found.'},404,request);
+      if(target.archived_at || target.status!=='active')return response({error:'Restore this employee before changing compensation.'},409,request);
+      const openDraft=await env.DB.prepare("SELECT i.id FROM payroll_items i JOIN payroll_batches b ON b.id=i.batch_id WHERE i.employee_id=? AND b.status='draft' LIMIT 1").bind(target.id).first();
+      if(openDraft)return response({error:'Complete or reject this employee draft payroll batch before changing their salary structure.'},409,request);
+      const d=await body(request), basic=Math.round(Number(d.basicSalary)*100), bonus=Math.round(Number(d.defaultBonus)*100), deductions=Math.round(Number(d.defaultDeductions)*100);
+      const effective=String(d.effectiveDate||'').trim(), reason=String(d.reason||'').trim().slice(0,240);
+      if(!Number.isSafeInteger(basic)||basic<0||basic>100000000000||!Number.isSafeInteger(bonus)||bonus<0||bonus>100000000000||!Number.isSafeInteger(deductions)||deductions<0||deductions>100000000000||!/^\d{4}-\d{2}-\d{2}$/.test(effective)||effective>new Date().toISOString().slice(0,10)||reason.length<3)
+        return response({error:'Enter valid salary, incentive, deduction, an effective date no later than today, and a reason.'},400,request);
+      if(basic+bonus<deductions)return response({error:'Default deductions cannot exceed basic salary plus default incentive.'},400,request);
+      const historyId=uid();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE payroll_employees SET basic_salary=?,default_bonus=?,default_deductions=?,updated_at=datetime('now') WHERE id=?").bind(basic,bonus,deductions,target.id),
+        env.DB.prepare('INSERT INTO payroll_compensation_history(id,employee_id,basic_salary,default_bonus,default_deductions,effective_date,reason,changed_by) VALUES(?,?,?,?,?,?,?,?)').bind(historyId,target.id,basic,bonus,deductions,effective,reason,user.id)
+      ]);
+      await audit(env,user,'payroll_compensation_updated','payroll_employee',target.id,{employeeNumber:target.employee_number,basicSalary:basic,defaultBonus:bonus,defaultDeductions:deductions,effectiveDate:effective,reason});
+      return response({ok:true,message:`Salary structure updated for ${target.employee_number}. New values apply to future payroll drafts.`,historyId},200,request);
     }
     const employeeAction=path.match(/^\/api\/admin\/payroll\/employees\/([^/]+)\/(archive|restore)$/);
     if(employeeAction && method==='POST'){
@@ -606,14 +635,23 @@ async function route(request, env) {
     }
     const itemMatch=path.match(/^\/api\/admin\/payroll\/items\/([^/]+)$/);
     if(itemMatch && method==='PATCH'){
-      const d=await body(request), methodType=String(d.paymentMethod||'');
-      if(!['internal','manual'].includes(methodType))return response({error:'Choose internal or manual payment.'},400,request);
-      const item=await env.DB.prepare(`SELECT i.id,b.status FROM payroll_items i JOIN payroll_batches b ON b.id=i.batch_id WHERE i.id=?`).bind(itemMatch[1]).first();
-      if(!item||item.status!=='draft')return response({error:'Only items in a draft batch can be edited.'},404,request);
-      const ref=String(d.reference||'').trim().slice(0,120);if(methodType==='manual'&&!ref)return response({error:'External payment reference is required.'},400,request);
-      await env.DB.prepare('UPDATE payroll_items SET payment_method=?,payment_reference=? WHERE id=?').bind(methodType,ref,item.id).run();
-      await audit(env,user,'payroll_payment_method_updated','payroll_item',item.id,{paymentMethod:methodType,reference:ref});
-      return response({ok:true},200,request);
+      const d=await body(request);
+      const item=await env.DB.prepare(`SELECT i.*,b.id AS batch_id,b.status AS batch_status FROM payroll_items i JOIN payroll_batches b ON b.id=i.batch_id WHERE i.id=?`).bind(itemMatch[1]).first();
+      if(!item||item.batch_status!=='draft'||item.status!=='pending')return response({error:'Only items in a draft batch can be edited.'},404,request);
+      const updates=[], binds=[]; let auditData={};
+      if(d.paymentMethod!==undefined){const methodType=String(d.paymentMethod);if(!['internal','manual'].includes(methodType))return response({error:'Choose internal or manual payment.'},400,request);const ref=String(d.reference||'').trim().slice(0,120);if(methodType==='manual'&&!ref)return response({error:'External payment reference is required.'},400,request);updates.push('payment_method=?','payment_reference=?');binds.push(methodType,ref);auditData.paymentMethod=methodType;auditData.reference=ref;}
+      if(d.bonus!==undefined||d.deductions!==undefined){
+        const bonus=Math.round(Number(d.bonus!==undefined?d.bonus:Number(item.bonus)/100)*100), deductions=Math.round(Number(d.deductions!==undefined?d.deductions:Number(item.deductions)/100)*100);
+        if(!Number.isSafeInteger(bonus)||bonus<0||bonus>100000000000||!Number.isSafeInteger(deductions)||deductions<0||deductions>100000000000)return response({error:'Enter valid non-negative incentive and deduction amounts.'},400,request);
+        const net=Number(item.basic_salary)+bonus-deductions-Number(item.advance_adjustment||0);if(net<0)return response({error:'Deductions and advance adjustment cannot exceed gross earnings.'},400,request);
+        updates.push('bonus=?','deductions=?','net_salary=?');binds.push(bonus,deductions,net);auditData.bonus=bonus;auditData.deductions=deductions;auditData.netSalary=net;
+      }
+      if(!updates.length)return response({error:'No payroll item changes supplied.'},400,request);
+      binds.push(item.id);await env.DB.prepare(`UPDATE payroll_items SET ${updates.join(',')} WHERE id=?`).bind(...binds).run();
+      const total=await env.DB.prepare("SELECT COALESCE(SUM(i.net_salary),0) AS total FROM payroll_items i WHERE i.batch_id=? AND i.status='pending'").bind(item.batch_id).first();
+      await env.DB.prepare("UPDATE payroll_batches SET total_amount=? WHERE id=? AND status='draft'").bind(Number(total?.total||0),item.batch_id).run();
+      await audit(env,user,'payroll_item_updated','payroll_item',item.id,auditData);
+      return response({ok:true,message:'Draft payroll item updated.',batchTotal:Number(total?.total||0)},200,request);
     }
     const batchMatch=path.match(/^\/api\/admin\/payroll\/batches\/([^/]+)\/(approve|reject)$/);
     if(batchMatch && method==='POST'){

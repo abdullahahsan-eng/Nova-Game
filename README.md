@@ -1,4 +1,4 @@
-# NovaBank v8.1.0 – HR & Payroll Management Edition
+# NovaBank v8.2.0 – Compensation & Payroll Controls Edition
 
 Fictional banking simulator built on Cloudflare Workers and D1. This release adds employee self-service salary advances, Super Admin approvals, advance recovery through payroll, immutable payslip snapshots with professional browser PDF/print output, and employee archive/restore.
 
@@ -26,3 +26,15 @@ Fictional banking simulator built on Cloudflare Workers and D1. This release add
 
 ## Validation limitations
 JavaScript syntax checks and local SQLite migration/workflow smoke tests passed. Live Cloudflare D1 integration and browser print rendering were not available in this environment; verify those in your staging deployment.
+
+
+## v8.2.0 – Compensation & Payroll Controls
+- Super Admin can revise recurring basic salary, incentive and deductions with effective date and reason; changes are audited and apply to future payroll drafts.
+- Draft payroll items support period-specific one-time incentive and deduction edits; batch totals recalculate.
+- Compensation history is stored in an additive table. Existing customer, account, ledger and payroll history is preserved.
+
+## Compensation controls (v8.2.0)
+- Super Admin can revise recurring basic salary, incentive and deductions from each active employee card. Each change requires an effective date (not later than today) and a reason.
+- Changes are blocked while the employee has an open draft payroll item, and apply to future drafts only.
+- A compensation audit history preserves opening salary values and each later revision.
+- During draft payroll review, Super Admin can set period-specific one-time incentive and deduction values per employee. Net pay and the batch total recalculate before approval.

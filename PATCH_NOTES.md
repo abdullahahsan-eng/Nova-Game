@@ -1,4 +1,4 @@
-# NovaBank v8.1.0 – HR & Payroll Management Edition
+# NovaBank v8.2.0 – Compensation & Payroll Controls Edition
 
 ## Release contents
 - Extends the v8.0.0 Staff Banking & Payroll foundation.
@@ -10,7 +10,7 @@
 - Employees and Super Admins can print payslips or use the browser print dialog's Save as PDF option. The layout is a professional A4 salary slip.
 - Super Admin can archive and restore employees. Archived employees are excluded from new payroll batches and employee self-service; historical records remain.
 - Payroll Control includes employee archive/restore, advance approvals and payslip archive.
-- Customer, Super Admin and Branch Counter footers show v8.1.0.
+- Customer, Super Admin and Branch Counter footers show v8.2.0.
 
 ## Files changed in this release
 - `worker.js`
@@ -58,3 +58,25 @@
 4. Commit/push and deploy using your existing Cloudflare Worker/Assets workflow.
 5. Test an advance request, Super Admin approval, linked account credit, payroll deduction, payroll execution, employee payslip PDF, archive and restore.
 6. Do not run any database reset or destructive schema command.
+
+
+## v8.2.0 – Compensation & Payroll Controls
+- Added auditable compensation history and Super Admin salary-structure updates.
+- Added per-period incentive and deduction controls on draft payroll items with net-pay and batch-total recalculation.
+- Compensation changes are blocked while the employee has an open draft payroll item to avoid ambiguous snapshots.
+- Additive D1 table only: `payroll_compensation_history`; no database reset or destructive migration.
+
+## v8.2.0 compensation controls
+- Recurring salary structure editor for basic salary, default incentive and default deductions, with effective date and mandatory reason.
+- Additive `payroll_compensation_history` table with opening snapshot and immutable change history.
+- Per-period incentive and deduction editing in draft payroll; net pay and batch totals recalculate.
+- Salary structure updates are blocked while an affected employee has a draft payroll item.
+
+## Files changed in this release
+- `worker.js`
+- `public/admin.html`
+- `public/admin.js`
+- `public/index.html`
+- `public/branch.html`
+- `README.md`
+- `PATCH_NOTES.md`
