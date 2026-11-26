@@ -24,3 +24,23 @@ CREATE TABLE IF NOT EXISTS quickpay_transfers (
   destination_account_id TEXT NOT NULL REFERENCES accounts(id), amount INTEGER NOT NULL, fee INTEGER NOT NULL DEFAULT 0,
   total_debit INTEGER NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Additive refund audit table. Original ledger entries are retained permanently.
+CREATE TABLE IF NOT EXISTS transaction_refunds (
+  id TEXT PRIMARY KEY,
+  original_ledger_id TEXT NOT NULL REFERENCES ledger(id),
+  original_group TEXT,
+  account_id TEXT NOT NULL REFERENCES accounts(id),
+  user_id TEXT NOT NULL REFERENCES users(id),
+  amount INTEGER NOT NULL CHECK(amount > 0),
+  reason TEXT NOT NULL,
+  admin_note TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'processed',
+  refund_reference TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  processed_by TEXT NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_refunds_original ON transaction_refunds(original_ledger_id, created_at);
+-- Worker performs a guarded ALTER TABLE for the subscription idempotency key
+-- so this migration remains safe when the subscription table already exists.
