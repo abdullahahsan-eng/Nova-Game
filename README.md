@@ -38,3 +38,11 @@ JavaScript syntax checks and local SQLite migration/workflow smoke tests passed.
 - Changes are blocked while the employee has an open draft payroll item, and apply to future drafts only.
 - A compensation audit history preserves opening salary values and each later revision.
 - During draft payroll review, Super Admin can set period-specific one-time incentive and deduction values per employee. Net pay and the batch total recalculate before approval.
+
+## Nova Credit Intelligence & QuickPay (v10 draft)
+- Customer Credit Intelligence score preview is visible without a subscription; detailed report access is subscription-gated.
+- Subscription pricing: ₹1,000 / 30 days, ₹4,500 / 180 days, ₹9,000 / 365 days.
+- Internal simulator score range: 300–900. Loan/card application submission captures an immutable score snapshot for staff review.
+- QuickPay beneficiary verification uses a 10-minute cooling period. Transfers above ₹50,000 charge 0.5% on the full transfer amount.
+- Feature tables are created additively by the Worker. An optional additive SQL file is in `migrations/001_credit_intelligence_quickpay.sql`; worker-managed score columns are added idempotently.
+- Before production deployment: take a D1 backup, test against a cloned D1 database, and verify all transaction paths in the deployed Worker. This package has not been live-tested against Cloudflare D1.

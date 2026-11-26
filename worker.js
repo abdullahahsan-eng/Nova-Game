@@ -366,6 +366,16 @@ async function ensurePayrollTables(env) {
 
 
 
+async function calculateInternalCreditScore(env,userId) {
+  const [cards,payments,late]=await Promise.all([
+    env.DB.prepare("SELECT COALESCE(SUM(credit_limit),0) AS lim,COALESCE(SUM(outstanding),0) AS due FROM virtual_cards WHERE user_id=? AND status!='closed'").bind(userId).first().catch(()=>({lim:0,due:0})),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM loan_payment_records WHERE borrower_user_id=?").bind(userId).first().catch(()=>({n:0})),
+    env.DB.prepare("SELECT COUNT(*) AS n FROM loan_emi_schedule s JOIN demo_loans l ON l.id=s.loan_id WHERE l.user_id=? AND s.status='pending' AND date(s.due_date)<date('now')").bind(userId).first().catch(()=>({n:0}))
+  ]);
+  const utilization=Number(cards?.lim||0)>0?Math.min(100,Number(cards.due||0)/Number(cards.lim)*100):0;
+  return {score:Math.max(300,Math.min(900,Math.round(850-Math.min(260,utilization*2.1)-Math.min(180,Number(late?.n||0)*35)+Math.min(35,Number(payments?.n||0)*3)))),utilization:Math.round(utilization)};
+}
+
 async function route(request, env) {
   const url = new URL(request.url), path = url.pathname, method = request.method;
   if (method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -795,6 +805,120 @@ async function route(request, env) {
     return response({ ok: true }, 200, request);
   }
   if (!user) return response({ error: "Please log in." }, 401, request);
+
+  // Nova Credit Intelligence + QuickPay: additive tables only; no existing customer data is rewritten.
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS credit_intelligence_subscriptions (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), plan_code TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount>0), starts_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active', payment_account_id TEXT REFERENCES accounts(id),
+    payment_reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_credit_sub_user_expiry ON credit_intelligence_subscriptions(user_id,status,expires_at)`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS credit_report_snapshots (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), score INTEGER NOT NULL CHECK(score BETWEEN 300 AND 900),
+    report_json TEXT NOT NULL, generated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_credit_snapshot_user ON credit_report_snapshots(user_id,generated_at DESC)`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS quickpay_beneficiaries (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), beneficiary_account_id TEXT NOT NULL REFERENCES accounts(id),
+    beneficiary_account_number TEXT NOT NULL, beneficiary_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'cooling',
+    verified_at TEXT NOT NULL DEFAULT (datetime('now')), eligible_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(user_id,beneficiary_account_id)
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS quickpay_transfers (
+    id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL REFERENCES users(id),
+    source_account_id TEXT NOT NULL REFERENCES accounts(id), beneficiary_id TEXT NOT NULL REFERENCES quickpay_beneficiaries(id),
+    destination_account_id TEXT NOT NULL REFERENCES accounts(id), amount INTEGER NOT NULL, fee INTEGER NOT NULL DEFAULT 0,
+    total_debit INTEGER NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`).run();
+
+  if (method==='GET' && path==='/api/credit-intelligence') {
+    const loans=await env.DB.prepare(`SELECT COUNT(*) AS total,COALESCE(SUM(CASE WHEN status='active' THEN outstanding_amount ELSE 0 END),0) AS outstanding FROM demo_loans WHERE user_id=?`).bind(user.id).first().catch(()=>({total:0,outstanding:0}));
+    const cards=await env.DB.prepare(`SELECT COUNT(*) AS total,COALESCE(SUM(credit_limit),0) AS limits,COALESCE(SUM(outstanding),0) AS outstanding FROM virtual_cards WHERE user_id=? AND status!='closed'`).bind(user.id).first().catch(()=>({total:0,limits:0,outstanding:0}));
+    const repayments=await env.DB.prepare(`SELECT COUNT(*) AS total FROM loan_payment_records WHERE borrower_user_id=?`).bind(user.id).first().catch(()=>({total:0}));
+    const late=await env.DB.prepare(`SELECT COUNT(*) AS total FROM loan_emi_schedule s JOIN demo_loans l ON l.id=s.loan_id WHERE l.user_id=? AND s.status='pending' AND date(s.due_date)<date('now')`).bind(user.id).first().catch(()=>({total:0}));
+    const utilization=Number(cards?.limits||0)>0?Math.min(100,Math.round(Number(cards.outstanding||0)/Number(cards.limits)*100)):0;
+    const score=Math.max(300,Math.min(900,Math.round(850-Math.min(260,utilization*2.1)-Math.min(180,Number(late?.total||0)*35)+Math.min(35,Number(repayments?.total||0)*3))));
+    const active=await env.DB.prepare(`SELECT id,plan_code,amount,starts_at,expires_at FROM credit_intelligence_subscriptions WHERE user_id=? AND status='active' AND expires_at>datetime('now') ORDER BY expires_at DESC LIMIT 1`).bind(user.id).first();
+    const latest=await env.DB.prepare(`SELECT id,score,generated_at FROM credit_report_snapshots WHERE user_id=? ORDER BY generated_at DESC LIMIT 1`).bind(user.id).first();
+    return response({score,range:{min:300,max:900},subscription:active||null,reportUnlocked:!!active,latestSnapshot:latest,summary:{loanCount:Number(loans?.total||0),loanOutstanding:Number(loans?.outstanding||0),cardCount:Number(cards?.total||0),cardLimit:Number(cards?.limits||0),cardOutstanding:Number(cards?.outstanding||0),utilization,lateEmis:Number(late?.total||0)}},200,request);
+  }
+  if (method==='POST' && path==='/api/credit-intelligence/subscribe') {
+    const d=await body(request), plans={'1m':{amount:100000,days:30},'6m':{amount:450000,days:180},'12m':{amount:900000,days:365}}, plan=plans[String(d.plan||'')];
+    if(!plan)return response({error:'Choose a valid subscription plan.'},400,request);
+    const existing=await env.DB.prepare(`SELECT expires_at FROM credit_intelligence_subscriptions WHERE user_id=? AND status='active' AND expires_at>datetime('now') ORDER BY expires_at DESC LIMIT 1`).bind(user.id).first();
+    const account=await env.DB.prepare(`SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'`).bind(String(d.accountId||''),user.id).first();
+    if(!account)return response({error:'Select one of your active accounts to pay.'},400,request);
+    if(Number(account.balance)<plan.amount)return response({error:'Insufficient account balance for this subscription.'},400,request);
+    const ref='NCI-'+uid().replaceAll('-','').slice(0,16).toUpperCase(), id=uid(), group=uid();
+    const start=existing?.expires_at||new Date().toISOString().slice(0,19).replace('T',' '), end=new Date(new Date(start.replace(' ','T')+'Z').getTime()+plan.days*86400000).toISOString().slice(0,19).replace('T',' ');
+    const after=Number(account.balance)-plan.amount;
+    await env.DB.batch([
+      env.DB.prepare('UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?').bind(plan.amount,account.id,plan.amount),
+      env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),account.id,group,'credit_report_subscription',plan.amount,after,`Nova Credit Intelligence ${d.plan} subscription`),
+      env.DB.prepare(`INSERT INTO credit_intelligence_subscriptions(id,user_id,plan_code,amount,starts_at,expires_at,payment_account_id,payment_reference) VALUES(?,?,?,?,?,?,?,?)`).bind(id,user.id,String(d.plan),plan.amount,start,end,account.id,ref)
+    ]);
+    await postTreasury(env,user,'subscription_revenue',plan.amount,`Nova Credit Intelligence subscription ${d.plan}`,'credit_subscription',id,group);
+    await audit(env,user,'credit_subscription_purchased','credit_subscription',id,{plan:d.plan,amount:plan.amount,reference:ref});
+    return response({ok:true,message:'Credit Intelligence subscription activated.',reference:ref,expiresAt:end},201,request);
+  }
+  if (method==='GET' && path==='/api/credit-intelligence/report') {
+    const sub=await env.DB.prepare(`SELECT id FROM credit_intelligence_subscriptions WHERE user_id=? AND status='active' AND expires_at>datetime('now') ORDER BY expires_at DESC LIMIT 1`).bind(user.id).first();
+    if(!sub)return response({error:'Your detailed Credit Report is locked. Purchase or renew a subscription to view it.'},402,request);
+    const [loans,cards,loanApps,cardApps,payments,late]=await Promise.all([
+      env.DB.prepare(`SELECT loan_number,principal_amount,outstanding_amount,tenure_months,remaining_months,status,created_at FROM demo_loans WHERE user_id=? ORDER BY created_at DESC`).bind(user.id).all(),
+      env.DB.prepare(`SELECT masked_number,credit_limit,outstanding,status,created_at FROM virtual_cards WHERE user_id=? ORDER BY created_at DESC`).bind(user.id).all(),
+      env.DB.prepare(`SELECT application_number,requested_amount,sanctioned_amount,status,created_at FROM loan_applications WHERE user_id=? ORDER BY created_at DESC`).bind(user.id).all(),
+      env.DB.prepare(`SELECT application_number,requested_limit,suggested_limit,sanctioned_limit,status,created_at FROM card_applications WHERE user_id=? ORDER BY created_at DESC`).bind(user.id).all(),
+      env.DB.prepare(`SELECT amount,reference,created_at FROM loan_payment_records WHERE borrower_user_id=? ORDER BY created_at DESC LIMIT 100`).bind(user.id).all(),
+      env.DB.prepare(`SELECT COUNT(*) AS n FROM loan_emi_schedule s JOIN demo_loans l ON l.id=s.loan_id WHERE l.user_id=? AND s.status='pending' AND date(s.due_date)<date('now')`).bind(user.id).first()
+    ]);
+    const info=await env.DB.prepare(`SELECT COALESCE(SUM(credit_limit),0) AS lim,COALESCE(SUM(outstanding),0) AS due FROM virtual_cards WHERE user_id=? AND status!='closed'`).bind(user.id).first();
+    const utilization=Number(info?.lim||0)>0?Math.min(100,Math.round(Number(info.due||0)/Number(info.lim)*100)):0;
+    const score=Math.max(300,Math.min(900,Math.round(850-Math.min(260,utilization*2.1)-Math.min(180,Number(late?.n||0)*35)+Math.min(35,(payments.results||[]).length*3))));
+    const report={score,generatedAt:new Date().toISOString(),creditUtilizationPercent:utilization,cardLimit:Number(info?.lim||0),cardOutstanding:Number(info?.due||0),lateEmis:Number(late?.n||0),loans:loans.results||[],cards:cards.results||[],loanApplications:loanApps.results||[],cardApplications:cardApps.results||[],repaymentHistory:payments.results||[],suggestedLoanLimit:Math.max(0,Math.round((Number(info?.lim||0)*0.25)+(Number(loans.results?.length||0)===0?500000:0))),suggestedCardLimit:Math.max(0,Math.round(Number(info?.lim||0)*1.2))};
+    const snapshotId=uid(); await env.DB.prepare(`INSERT INTO credit_report_snapshots(id,user_id,score,report_json) VALUES(?,?,?,?)`).bind(snapshotId,user.id,score,JSON.stringify(report)).run();
+    return response({report,snapshotId},200,request);
+  }
+  if (method==='GET' && path==='/api/quickpay/beneficiaries') {
+    const rows=await env.DB.prepare(`SELECT b.id,b.beneficiary_account_number,b.beneficiary_name,b.status,b.eligible_at,b.created_at,a.status AS account_status FROM quickpay_beneficiaries b JOIN accounts a ON a.id=b.beneficiary_account_id WHERE b.user_id=? ORDER BY b.created_at DESC`).bind(user.id).all();
+    return response({beneficiaries:(rows.results||[]).map(b=>({...b,status:b.account_status!=='active'?'blocked':(new Date(b.eligible_at).getTime()<=Date.now()?'active':'cooling')}))},200,request);
+  }
+  if (method==='POST' && path==='/api/quickpay/beneficiaries') {
+    const d=await body(request), number=String(d.accountNumber||'').trim();
+    const dest=await env.DB.prepare(`SELECT a.id,a.user_id,a.account_number,a.status,u.display_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.account_number=?`).bind(number).first();
+    if(!dest||dest.status!=='active'||dest.user_id===user.id)return response({error:'Recipient account not found, inactive, or belongs to you.'},400,request);
+    const old=await env.DB.prepare(`SELECT id FROM quickpay_beneficiaries WHERE user_id=? AND beneficiary_account_id=?`).bind(user.id,dest.id).first();
+    const id=old?.id||uid();
+    await env.DB.prepare(`INSERT INTO quickpay_beneficiaries(id,user_id,beneficiary_account_id,beneficiary_account_number,beneficiary_name,status,eligible_at) VALUES(?,?,?,?,?,'cooling',strftime('%Y-%m-%dT%H:%M:%SZ','now','+10 minutes')) ON CONFLICT(user_id,beneficiary_account_id) DO UPDATE SET beneficiary_account_number=excluded.beneficiary_account_number,beneficiary_name=excluded.beneficiary_name,status='cooling',verified_at=datetime('now'),eligible_at=strftime('%Y-%m-%dT%H:%M:%SZ','now','+10 minutes'),updated_at=datetime('now')`).bind(id,user.id,dest.id,dest.account_number,String(dest.display_name||'Verified NovaBank account holder')).run();
+    await audit(env,user,old?'quickpay_beneficiary_reset':'quickpay_beneficiary_added','beneficiary',id,{accountNumber:number,coolingMinutes:10});
+    return response({ok:true,message:'Beneficiary verified. A 10-minute cooling period has started.',eligibleAt:new Date(Date.now()+600000).toISOString()},201,request);
+  }
+  const removeBeneficiary=path.match(/^\/api\/quickpay\/beneficiaries\/([^/]+)$/);
+  if(method==='DELETE'&&removeBeneficiary){const r=await env.DB.prepare('DELETE FROM quickpay_beneficiaries WHERE id=? AND user_id=?').bind(removeBeneficiary[1],user.id).run();if(!r.meta?.changes)return response({error:'Beneficiary not found.'},404,request);await audit(env,user,'quickpay_beneficiary_removed','beneficiary',removeBeneficiary[1]);return response({ok:true,message:'Beneficiary removed.'},200,request);}
+  if(method==='POST'&&path==='/api/quickpay/transfer'){
+    const d=await body(request), amount=Math.round(Number(d.amount||0)*100), key=String(d.idempotencyKey||'');
+    if(!Number.isSafeInteger(amount)||amount<100||amount>100000000||key.length<12||key.length>100)return response({error:'Enter a valid amount and unique payment reference.'},400,request);
+    const previous=await env.DB.prepare('SELECT reference,amount,fee FROM quickpay_transfers WHERE idempotency_key=? AND user_id=?').bind(key,user.id).first();if(previous)return response({ok:true,duplicate:true,reference:previous.reference,amount:previous.amount/100,fee:previous.fee/100,message:'This payment was already processed.'},200,request);
+    const ben=await env.DB.prepare(`SELECT b.*,a.status AS dest_status FROM quickpay_beneficiaries b JOIN accounts a ON a.id=b.beneficiary_account_id WHERE b.id=? AND b.user_id=?`).bind(String(d.beneficiaryId||''),user.id).first();
+    if(!ben||ben.dest_status!=='active')return response({error:'Select an active verified beneficiary.'},400,request);
+    if(new Date(ben.eligible_at).getTime()>Date.now())return response({error:'Beneficiary cooling period is still active. Try again after the eligible time.'},409,request);
+    const source=await env.DB.prepare(`SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'`).bind(String(d.sourceAccountId||''),user.id).first();if(!source||source.id===ben.beneficiary_account_id)return response({error:'Choose a valid source account.'},400,request);
+    const fee=amount>5000000?Math.round(amount*0.005):0,total=amount+fee;if(Number(source.balance)<total)return response({error:'Insufficient balance for transfer plus fee.'},400,request);
+    const dest=await env.DB.prepare(`SELECT * FROM accounts WHERE id=? AND status='active'`).bind(ben.beneficiary_account_id).first();if(!dest)return response({error:'Beneficiary account is not active.'},400,request);
+    const ref='QP-'+uid().replaceAll('-','').slice(0,16).toUpperCase(), group=uid(), after=Number(source.balance)-total, destAfter=Number(dest.balance)+amount, tid=uid();
+    try{await env.DB.batch([
+      env.DB.prepare('UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?').bind(total,source.id,total),
+      env.DB.prepare('UPDATE accounts SET balance=balance+? WHERE id=?').bind(amount,dest.id),
+      env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),source.id,group,'transfer_out',amount,after+fee,`Nova QuickPay transfer to ${dest.account_number}`),
+      ...(fee?[env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),source.id,group,'quickpay_transfer_fee',fee,after,'Nova QuickPay 0.5% transfer fee')]:[]),
+      env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),dest.id,group,'transfer_in',amount,destAfter,`Nova QuickPay received from ${source.account_number}`),
+      env.DB.prepare(`INSERT INTO quickpay_transfers(id,idempotency_key,user_id,source_account_id,beneficiary_id,destination_account_id,amount,fee,total_debit,reference) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(tid,key,user.id,source.id,ben.id,dest.id,amount,fee,total,ref)
+    ]);}catch(e){const duplicate=await env.DB.prepare('SELECT reference FROM quickpay_transfers WHERE idempotency_key=?').bind(key).first();if(duplicate)return response({ok:true,duplicate:true,reference:duplicate.reference},200,request);throw e;}
+    if(fee)await postTreasury(env,user,'quickpay_transfer_fee',fee,'Nova QuickPay 0.5% transfer fee','quickpay_transfer',tid,group);
+    await audit(env,user,'quickpay_transfer_completed','quickpay_transfer',tid,{reference:ref,amount,fee,total});await notify(env,dest.user_id,'QuickPay payment received',`N₹${(amount/100).toFixed(2)} received. Reference ${ref}.`);
+    return response({ok:true,message:'QuickPay transfer successful.',reference:ref,amount:amount/100,fee:fee/100,totalDebit:total/100,receipt:{reference:ref,beneficiary:ben.beneficiary_name,accountNumber:dest.account_number,amount:amount/100,fee:fee/100,totalDebit:total/100}},200,request);
+  }
   if (method==='POST' && path==='/api/change-password') {
     const d=await body(request), currentPassword=String(d.currentPassword||''), newPassword=String(d.newPassword||'');
     if(newPassword.length<12||newPassword.length>128) return response({error:'New password must be 12–128 characters.'},400,request);
@@ -811,7 +935,7 @@ async function route(request, env) {
   }
   if (Number(user.must_change_password||0)===1 && !['/api/me','/api/change-password','/api/logout'].includes(path)) return response({error:'For security, change your temporary password before continuing.'},403,request);
   if (STAFF_ROLES.has(staffRole(user)) && method==='POST' && (
-    path==='/api/transfer' || path==='/api/loans' || path==='/api/cards' || path==='/api/card-bill/pay' ||
+    path==='/api/transfer' || path==='/api/quickpay/transfer' || path==='/api/quickpay/beneficiaries' || path==='/api/loans' || path==='/api/cards' || path==='/api/card-bill/pay' ||
     path==='/api/account-closure-requests' || path==='/api/password-recovery' ||
     /^\/api\/cards\/[^/]+\/(purchase|repay|activate|control-request)$/.test(path) ||
     /^\/api\/loans\/[^/]+\/(accept|repay|closure-request)$/.test(path) || /^\/api\/cards\/[^/]+\/closure-request$/.test(path)
@@ -1093,7 +1217,7 @@ async function route(request, env) {
     await ensureTreasury(env);
     const account=await env.DB.prepare("SELECT * FROM treasury_accounts WHERE id='nova-treasury-main'").first();
     const rows=await env.DB.prepare("SELECT * FROM treasury_ledger ORDER BY created_at DESC LIMIT 500").all();
-    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COALESCE(SUM(amount),0) AS balance,COUNT(*) AS entries,COALESCE(SUM(CASE WHEN type IN ('loan_processing_fee','loan_file_charge','card_joining_fee','credit_card_transfer_fee','merchant_commission','subscription_revenue','service_fee') THEN amount ELSE 0 END),0) AS revenue FROM treasury_ledger").first();
+    const totals=await env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN amount>0 THEN amount ELSE 0 END),0) AS inflow,COALESCE(SUM(CASE WHEN amount<0 THEN -amount ELSE 0 END),0) AS outflow,COALESCE(SUM(amount),0) AS balance,COUNT(*) AS entries,COALESCE(SUM(CASE WHEN type IN ('loan_processing_fee','loan_file_charge','card_joining_fee','credit_card_transfer_fee','merchant_commission','subscription_revenue','quickpay_transfer_fee','service_fee') THEN amount ELSE 0 END),0) AS revenue FROM treasury_ledger").first();
     const breakdown=await env.DB.prepare("SELECT type,COALESCE(SUM(amount),0) AS amount,COUNT(*) AS entries FROM treasury_ledger GROUP BY type ORDER BY ABS(SUM(amount)) DESC").all();
     account.current_balance=Number(totals?.balance||0);
     return response({account,transactions:rows.results||[],totals:totals||{},breakdown:breakdown.results||[]},200,request);
@@ -1471,9 +1595,11 @@ async function route(request, env) {
     const income = Math.max(0, Math.round(Number(d.monthlyIncome||0)*100)), expenses = Math.max(0, Math.round(Number(d.monthlyExpenses||0)*100)), emi = Math.max(0, Math.round(Number(d.existingEmi||0)*100));
     const eligible = Math.max(0, Math.min(amount, Math.round(Math.max(0, income-expenses-emi)*tenure*0.3)));
     await ensureApplicationTracking(env);
+    await ensureColumn(env,"loan_applications","credit_score_snapshot","INTEGER NOT NULL DEFAULT 0");
+    const creditSnapshot=await calculateInternalCreditScore(env,user.id);
     const id = uid(), applicationNumber = newApplicationNumber("NB-LN", id);
-    await env.DB.prepare("INSERT INTO loan_applications(id,user_id,requested_amount,tenure_months,purpose,monthly_income,monthly_expenses,existing_emi,eligible_suggestion,application_number) VALUES(?,?,?,?,?,?,?,?,?,?)")
-      .bind(id,user.id,amount,tenure,String(d.purpose).trim(),income,expenses,emi,eligible,applicationNumber).run();
+    await env.DB.prepare("INSERT INTO loan_applications(id,user_id,requested_amount,tenure_months,purpose,monthly_income,monthly_expenses,existing_emi,eligible_suggestion,application_number,credit_score_snapshot) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+      .bind(id,user.id,amount,tenure,String(d.purpose).trim(),income,expenses,emi,eligible,applicationNumber,creditSnapshot.score).run();
     await audit(env,user,"loan_application_submitted","loan_application",id,{applicationNumber});
     await notify(env,user.id,"Loan application submitted",`Your loan application ${applicationNumber} has been submitted and is awaiting review.`);
     return response({ ok:true, id, applicationNumber, suggestedEligibility: eligible/100, message:"Demo application submitted for review." },201,request);
@@ -1498,14 +1624,16 @@ async function route(request, env) {
     // Existing outstanding informs the risk adjustment; this is not a real credit decision.
     const suggested=Math.max(0,Math.min(20000000,Math.round(monthlySurplus*3*Math.max(0.25,1-Math.min(0.75,(debt+loanOutstanding)/Math.max(income*12,1))))));
     await ensureApplicationTracking(env);
+    await ensureColumn(env,"card_applications","credit_score_snapshot","INTEGER NOT NULL DEFAULT 0");
+    const creditSnapshot=await calculateInternalCreditScore(env,user.id);
     const id=uid(), applicationNumber=newApplicationNumber("NB-CC",id);
     // card_applications.requested_limit has a CHECK(requested_limit > 0).
     // The customer is applying for bank assessment rather than requesting a fixed limit,
     // so persist the calculated suggested limit; use the smallest positive minor unit
     // only when the assessment estimate is zero, preserving compatibility with existing D1.
     const requestedLimit = Math.max(1, suggested);
-    await env.DB.prepare("INSERT INTO card_applications(id,user_id,requested_limit,monthly_income,monthly_expenses,existing_debt,suggested_limit,existing_emi,loan_outstanding,application_number) VALUES(?,?,?,?,?,?,?,?,?,?)")
-      .bind(id,user.id,requestedLimit,income,expenses,debt,suggested,emi,loanOutstanding,applicationNumber).run();
+    await env.DB.prepare("INSERT INTO card_applications(id,user_id,requested_limit,monthly_income,monthly_expenses,existing_debt,suggested_limit,existing_emi,loan_outstanding,application_number,credit_score_snapshot) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+      .bind(id,user.id,requestedLimit,income,expenses,debt,suggested,emi,loanOutstanding,applicationNumber,creditSnapshot.score).run();
     await audit(env,user,"card_application_submitted","card_application",id,{applicationNumber,income,expenses,existingEmi:emi,existingCardDebt:debt,loanOutstanding,suggestedLimit:suggested});
     await notify(env,user.id,"Credit card application submitted",`Your credit card application ${applicationNumber} has been submitted and is awaiting review.`);
     return response({ok:true,id,applicationNumber,suggestedLimit:suggested/100,message:"Demo card application submitted for bank assessment."},201,request);

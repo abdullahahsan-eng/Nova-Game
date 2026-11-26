@@ -80,3 +80,13 @@
 - `public/branch.html`
 - `README.md`
 - `PATCH_NOTES.md`
+
+## v10.0 / v10.1 — Nova Credit Intelligence & Nova QuickPay (implementation draft)
+- Added additive tables for paid Credit Intelligence subscriptions, internal credit report snapshots, QuickPay beneficiaries, and idempotent QuickPay transfers.
+- Credit Intelligence plans: ₹1,000 / 30 days, ₹4,500 / 180 days, ₹9,000 / 365 days. Detailed customer report is subscription-gated; score preview remains visible.
+- Internal score range is 300–900 and is labelled as a simulator score, not CIBIL or a bureau score.
+- Report includes utilization, loans, cards, applications, repayment records, late EMI count and suggested loan/card limits; browser print supports Save as PDF.
+- QuickPay beneficiary verification starts a 10-minute cooling period. Transfers over ₹50,000 carry 0.5% on the full transfer amount. Fee is confirmed before payment; receipt is printable.
+- QuickPay transfer requests carry a unique idempotency key to reduce duplicate payment risk.
+- Existing tables are not dropped or rebuilt. Worker lazily creates feature tables; `migrations/001_credit_intelligence_quickpay.sql` is an optional additive migration for controlled deployment.
+- This draft has not been tested against a live Cloudflare D1 database. Back up D1 and validate on a cloned database before deployment.
