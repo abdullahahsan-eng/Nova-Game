@@ -46,3 +46,6 @@ JavaScript syntax checks and local SQLite migration/workflow smoke tests passed.
 - QuickPay beneficiary verification uses a 10-minute cooling period. Transfers above ₹50,000 charge 0.5% on the full transfer amount.
 - Feature tables are created additively by the Worker. An optional additive SQL file is in `migrations/001_credit_intelligence_quickpay.sql`; worker-managed score columns are added idempotently.
 - Before production deployment: take a D1 backup, test against a cloned D1 database, and verify all transaction paths in the deployed Worker. This package has not been live-tested against Cloudflare D1.
+
+### Refund Management & payment confirmations (draft patch)
+The Super Admin portal now includes a Refund Management tab for full or partial refunds against supported debit entries. Refunds are recorded as separate ledger/audit entries; source transactions are never deleted. Customer payment flows show a full-screen confirmation after a successful API response. Before production deployment, take a D1 backup, test on a cloned D1 database, and run concurrency and reversal regression tests. The refund module currently supports account transfers, Credit Intelligence subscriptions, and QuickPay fee entries; it intentionally excludes loan/card repayments and card-bill reversal until their linked product accounting is implemented.

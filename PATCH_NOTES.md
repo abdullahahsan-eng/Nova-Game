@@ -90,3 +90,14 @@
 - QuickPay transfer requests carry a unique idempotency key to reduce duplicate payment risk.
 - Existing tables are not dropped or rebuilt. Worker lazily creates feature tables; `migrations/001_credit_intelligence_quickpay.sql` is an optional additive migration for controlled deployment.
 - This draft has not been tested against a live Cloudflare D1 database. Back up D1 and validate on a cloned database before deployment.
+
+## Refund Management & Payment Confirmation Hardening (draft patch)
+- Added Super Admin Refund Management API and screen for full/partial refunds against supported original debit ledger entries (`transfer_out`, `credit_report_subscription`, `quickpay_transfer_fee`).
+- Refunds create separate `refund_credit` ledger entries and immutable refund audit records; original entries are retained.
+- Transfer reversals also debit the matching recipient account and are blocked if the matching credit cannot be found or the recipient lacks available balance.
+- Added subscription idempotency key storage and duplicate-response handling; customer plan buttons lock while a purchase is processing.
+- Added a full-screen customer payment confirmation with print/save-PDF action for normal account transfer, QuickPay, subscription purchase, card-bill payment and loan-payment API success responses.
+- Added a QuickPay submit lock and stable request key during retries.
+- Added additive `transaction_refunds` table to migration 001. Worker also creates it lazily and adds the subscription idempotency column/index.
+- Scope note: refund UI currently lists and processes the supported ledger types above. Loan/card repayment and card-bill reversals are deliberately not offered until linked product-balance reversal logic is implemented and tested.
+- Validation completed locally: JavaScript syntax checks and SQLite additive migration smoke test. Live Cloudflare Worker/D1 deployment and end-to-end concurrent transaction tests remain outstanding.
