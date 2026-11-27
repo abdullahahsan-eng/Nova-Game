@@ -1636,7 +1636,7 @@ async function route(request, env) {
     await postTreasury(env,user,"internal_transfer",0,`Internal demo transfer · ${source.account_number} → ${dest.account_number}`,"transaction",group,group);
     await audit(env, user, "demo_transfer", "transaction", group, { amount, from: source.id, to: dest.id });
     await notify(env, dest.user_id, "Money received", `N₹${(amount/100).toFixed(2)} demo transfer received.`);
-    return response({ ok: true, message: "Demo transfer submitted.", transactionId: group }, 200, request);
+    return response({ ok: true, status: "SUCCESS", message: "Demo transfer completed successfully.", transactionId: group, reference: group, amount: amount / 100, fee: 0, totalDebit: amount / 100 }, 200, request);
   }
   if (method === "GET" && path === "/api/application-track") {
     await ensureApplicationTracking(env);
