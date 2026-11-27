@@ -689,12 +689,22 @@ async function route(request, env) {
         const slipId=uid(),slipNo=`NB-PS-${new Date().getFullYear()}-${slipId.slice(0,8).toUpperCase()}`;
         statements.push(env.DB.prepare('INSERT OR IGNORE INTO payroll_payslips(id,payslip_number,payroll_item_id,employee_id,user_id,snapshot_json) VALUES(?,?,?,?,?,?)').bind(slipId,slipNo,it.id,it.employee_id,it.user_id,JSON.stringify(snap)));
       }
+      // Commit salary credits, payroll item/payslip state, batch status and Treasury
+      // expense in one D1 batch. A failure must not leave paid salaries with a 500 response.
+      const treasuryAfter=Number(treasury?.balance||0)-total;
+      statements.push(env.DB.prepare("UPDATE treasury_accounts SET current_balance=?,updated_at=datetime('now') WHERE id='nova-treasury-main'").bind(treasuryAfter));
+      statements.push(env.DB.prepare("INSERT INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id) VALUES(?,?,?,?,?,?,?,?,?)").bind(uid(),group,'payroll_expense',-total,treasuryAfter,`Payroll batch ${batch.batch_number}`,'payroll_batch',batch.id,user.id));
       statements.push(env.DB.prepare("UPDATE payroll_batches SET status='paid',approved_by=?,approved_at=datetime('now') WHERE id=? AND status='draft'").bind(user.id,batch.id));
       await env.DB.batch(statements);
-      await postTreasury(env,user,'payroll_expense',-total,`Payroll batch ${batch.batch_number}`,'payroll_batch',batch.id,group);
-      for(const it of items.results){await notify(env,it.user_id,'Salary credited',`Your NovaBank demo payroll for ${batch.period_start} to ${batch.period_end} has been processed. Batch: ${batch.batch_number}.`)}
-      await audit(env,user,'payroll_batch_paid','payroll_batch',batch.id,{batchNumber:batch.batch_number,total,employees:items.results.length});
-      return response({ok:true,message:`Payroll batch ${batch.batch_number} marked paid.`},200,request);
+      // Notifications/audit are post-commit side effects. Their failure must not report
+      // the already completed salary payment as failed and invite an unsafe retry.
+      for(const it of items.results){
+        try { await notify(env,it.user_id,'Salary credited',`Your NovaBank demo payroll for ${batch.period_start} to ${batch.period_end} has been processed. Batch: ${batch.batch_number}.`); }
+        catch(e) { console.error('Payroll notification failed', {batchId:batch.id, employeeId:it.employee_id, error:String(e?.message||e)}); }
+      }
+      try { await audit(env,user,'payroll_batch_paid','payroll_batch',batch.id,{batchNumber:batch.batch_number,total,employees:items.results.length}); }
+      catch(e) { console.error('Payroll audit write failed', {batchId:batch.id, error:String(e?.message||e)}); }
+      return response({ok:true,message:`Payroll batch ${batch.batch_number} marked paid.`,total,treasuryBalance:treasuryAfter},200,request);
     }
     return response({error:'Payroll route not found.'},404,request);
   }
@@ -831,10 +841,6 @@ async function route(request, env) {
     destination_account_id TEXT NOT NULL REFERENCES accounts(id), amount INTEGER NOT NULL, fee INTEGER NOT NULL DEFAULT 0,
     total_debit INTEGER NOT NULL, reference TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS transaction_refunds (id TEXT PRIMARY KEY, original_ledger_id TEXT NOT NULL REFERENCES ledger(id), original_group TEXT, account_id TEXT NOT NULL REFERENCES accounts(id), user_id TEXT NOT NULL REFERENCES users(id), amount INTEGER NOT NULL CHECK(amount>0), reason TEXT NOT NULL, admin_note TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'processed', refund_reference TEXT NOT NULL UNIQUE, idempotency_key TEXT NOT NULL UNIQUE, processed_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
-  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_refunds_original ON transaction_refunds(original_ledger_id,created_at)').run();
-  await ensureColumn(env,'credit_intelligence_subscriptions','idempotency_key','TEXT');
-  await env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_sub_idempotency ON credit_intelligence_subscriptions(idempotency_key) WHERE idempotency_key IS NOT NULL').run();
 
   if (method==='GET' && path==='/api/credit-intelligence') {
     const loans=await env.DB.prepare(`SELECT COUNT(*) AS total,COALESCE(SUM(CASE WHEN status='active' THEN outstanding_amount ELSE 0 END),0) AS outstanding FROM demo_loans WHERE user_id=?`).bind(user.id).first().catch(()=>({total:0,outstanding:0}));
@@ -848,11 +854,8 @@ async function route(request, env) {
     return response({score,range:{min:300,max:900},subscription:active||null,reportUnlocked:!!active,latestSnapshot:latest,summary:{loanCount:Number(loans?.total||0),loanOutstanding:Number(loans?.outstanding||0),cardCount:Number(cards?.total||0),cardLimit:Number(cards?.limits||0),cardOutstanding:Number(cards?.outstanding||0),utilization,lateEmis:Number(late?.total||0)}},200,request);
   }
   if (method==='POST' && path==='/api/credit-intelligence/subscribe') {
-    const d=await body(request), plans={'1m':{amount:100000,days:30},'6m':{amount:450000,days:180},'12m':{amount:900000,days:365}}, plan=plans[String(d.plan||'')], idem=String(d.idempotencyKey||'');
+    const d=await body(request), plans={'1m':{amount:100000,days:30},'6m':{amount:450000,days:180},'12m':{amount:900000,days:365}}, plan=plans[String(d.plan||'')];
     if(!plan)return response({error:'Choose a valid subscription plan.'},400,request);
-    if(idem.length<12||idem.length>100)return response({error:'A valid payment request key is required. Please retry.'},400,request);
-    const already=await env.DB.prepare('SELECT payment_reference,amount,expires_at FROM credit_intelligence_subscriptions WHERE user_id=? AND idempotency_key=?').bind(user.id,idem).first();
-    if(already)return response({ok:true,duplicate:true,message:'This subscription payment was already processed.',reference:already.payment_reference,amount:already.amount/100,expiresAt:already.expires_at},200,request);
     const existing=await env.DB.prepare(`SELECT expires_at FROM credit_intelligence_subscriptions WHERE user_id=? AND status='active' AND expires_at>datetime('now') ORDER BY expires_at DESC LIMIT 1`).bind(user.id).first();
     const account=await env.DB.prepare(`SELECT * FROM accounts WHERE id=? AND user_id=? AND status='active'`).bind(String(d.accountId||''),user.id).first();
     if(!account)return response({error:'Select one of your active accounts to pay.'},400,request);
@@ -863,7 +866,7 @@ async function route(request, env) {
     await env.DB.batch([
       env.DB.prepare('UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?').bind(plan.amount,account.id,plan.amount),
       env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),account.id,group,'credit_report_subscription',plan.amount,after,`Nova Credit Intelligence ${d.plan} subscription`),
-      env.DB.prepare(`INSERT INTO credit_intelligence_subscriptions(id,user_id,plan_code,amount,starts_at,expires_at,payment_account_id,payment_reference,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?)`).bind(id,user.id,String(d.plan),plan.amount,start,end,account.id,ref,idem)
+      env.DB.prepare(`INSERT INTO credit_intelligence_subscriptions(id,user_id,plan_code,amount,starts_at,expires_at,payment_account_id,payment_reference) VALUES(?,?,?,?,?,?,?,?)`).bind(id,user.id,String(d.plan),plan.amount,start,end,account.id,ref)
     ]);
     await postTreasury(env,user,'subscription_revenue',plan.amount,`Nova Credit Intelligence subscription ${d.plan}`,'credit_subscription',id,group);
     await audit(env,user,'credit_subscription_purchased','credit_subscription',id,{plan:d.plan,amount:plan.amount,reference:ref});
@@ -1217,66 +1220,6 @@ async function route(request, env) {
     await audit(env,user,isLoan?"loan_application_soft_deleted":"card_application_soft_deleted",isLoan?"loan_application":"card_application",id,{status:row.status,note});
     await notify(env,row.user_id,isLoan?"Loan review item archived":"Card review item archived","Your reviewed request was archived from the admin queue. Its history remains available.");
     return response({ok:true,message:"Removed from active review list; audit history retained."},200,request);
-  }
-
-  if (method === 'GET' && path === '/api/admin/refunds') {
-    if (!user || !isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
-    const q=String(new URL(request.url).searchParams.get('q')||'').trim();
-    const like=`%${q}%`;
-    const rows=await env.DB.prepare(`SELECT l.id AS ledger_id,l.transaction_group,l.account_id,l.type,l.amount,l.description,l.created_at,l.balance_after,a.account_number,u.id AS user_id,u.display_name,u.username,COALESCE((SELECT SUM(r.amount) FROM transaction_refunds r WHERE r.original_ledger_id=l.id),0) AS refunded_amount FROM ledger l JOIN accounts a ON a.id=l.account_id JOIN users u ON u.id=a.user_id WHERE l.amount>0 AND l.type IN ('transfer_out','credit_report_subscription','quickpay_transfer_fee') AND (?='' OR l.id LIKE ? OR l.transaction_group LIKE ? OR a.account_number LIKE ? OR u.display_name LIKE ? OR u.username LIKE ?) ORDER BY l.created_at DESC LIMIT 250`).bind(q,like,like,like,like,like).all();
-    const refunds=await env.DB.prepare(`SELECT r.*,u.display_name,u.username,a.account_number FROM transaction_refunds r JOIN users u ON u.id=r.user_id JOIN accounts a ON a.id=r.account_id ORDER BY r.created_at DESC LIMIT 250`).all();
-    return response({transactions:rows.results||[],refunds:refunds.results||[]},200,request);
-  }
-  if (method === 'POST' && path === '/api/admin/refunds') {
-    if (!user || !isSuperAdmin(user)) return response({error:'Super Admin permission required.'},403,request);
-    const d=await body(request), ledgerId=String(d.ledgerId||''), reason=String(d.reason||'').trim().slice(0,240), note=String(d.adminNote||'').trim().slice(0,240), idem=String(d.idempotencyKey||'');
-    const rupees=Number(d.amount), amount=Math.round(rupees*100);
-    if(!ledgerId||!reason||!Number.isSafeInteger(amount)||amount<=0||idem.length<12)return response({error:'Select an original transaction, enter a valid refund amount and reason.'},400,request);
-    const prior=await env.DB.prepare('SELECT refund_reference,amount FROM transaction_refunds WHERE idempotency_key=?').bind(idem).first();
-    if(prior)return response({ok:true,duplicate:true,reference:prior.refund_reference,amount:prior.amount/100,message:'This refund was already processed.'},200,request);
-    const original=await env.DB.prepare(`SELECT l.*,a.user_id,a.status AS account_status FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE l.id=? AND l.amount>0 AND l.type IN ('transfer_out','credit_report_subscription','quickpay_transfer_fee')`).bind(ledgerId).first();
-    if(!original)return response({error:'Eligible original debit transaction not found.'},404,request);
-    const total=await env.DB.prepare('SELECT COALESCE(SUM(amount),0) AS n FROM transaction_refunds WHERE original_ledger_id=?').bind(ledgerId).first();
-    const remaining=Number(original.amount)-Number(total?.n||0);
-    if(amount>remaining)return response({error:`Refund exceeds refundable balance. Maximum available: ₹${(remaining/100).toFixed(2)}.`},400,request);
-    if(original.account_status!=='active')return response({error:'Customer account is not active; refund cannot be posted.'},409,request);
-    const refundId=uid(), ref='RF-'+uid().replaceAll('-','').slice(0,16).toUpperCase(), group=uid();
-    const current=await env.DB.prepare('SELECT balance FROM accounts WHERE id=?').bind(original.account_id).first();
-    const newBalance=Number(current.balance)+amount;
-    let treasuryRefund=null;
-    if(['credit_report_subscription','quickpay_transfer_fee'].includes(original.type)) {
-      await ensureTreasury(env);
-      const treasuryNow=await env.DB.prepare('SELECT COALESCE(SUM(amount),0) AS balance FROM treasury_ledger').first();
-      if(Number(treasuryNow?.balance||0)<amount)return response({error:'Treasury has insufficient available funds to support this revenue refund. No refund was posted.'},409,request);
-      treasuryRefund={before:Number(treasuryNow?.balance||0),after:Number(treasuryNow?.balance||0)-amount};
-    }
-    const batch=[
-      env.DB.prepare('UPDATE accounts SET balance=balance+? WHERE id=?').bind(amount,original.account_id),
-      env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),original.account_id,group,'refund_credit',amount,newBalance,`Refund for ${original.id}: ${reason}`),
-      env.DB.prepare(`INSERT INTO transaction_refunds(id,original_ledger_id,original_group,account_id,user_id,amount,reason,admin_note,refund_reference,idempotency_key,processed_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)`).bind(refundId,original.id,original.transaction_group,original.account_id,original.user_id,amount,reason,note,ref,idem,user.id)
-    ];
-    if(treasuryRefund) {
-      const treasuryGroup=uid(), treasuryId=uid();
-      batch.push(env.DB.prepare(`INSERT INTO treasury_ledger(id,transaction_group,type,amount,balance_after,description,source_type,source_id,actor_user_id,reference) VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(treasuryId,treasuryGroup,'revenue_refund',-amount,treasuryRefund.after,`Revenue refund for original transaction ${original.id}`,'transaction_refund',refundId,user.id,`refund-${ref}`));
-      batch.push(env.DB.prepare(`UPDATE treasury_accounts SET current_balance=?,updated_at=datetime('now') WHERE id='nova-treasury-main'`).bind(treasuryRefund.after));
-    }
-    if(['transfer_out'].includes(original.type)) {
-      const incoming=await env.DB.prepare(`SELECT l.*,a.balance AS recipient_balance,a.user_id AS recipient_user FROM ledger l JOIN accounts a ON a.id=l.account_id WHERE l.transaction_group=? AND l.type='transfer_in' LIMIT 1`).bind(original.transaction_group).first();
-      if(!incoming)return response({error:'Matching recipient credit could not be found; refund blocked for safety.'},409,request);
-      if(Number(incoming.recipient_balance)<amount)return response({error:'Recipient account has insufficient available balance for this transfer reversal.'},409,request);
-      batch.push(env.DB.prepare('UPDATE accounts SET balance=balance-? WHERE id=? AND balance>=?').bind(amount,incoming.account_id,amount));
-      batch.push(env.DB.prepare(`INSERT INTO ledger(id,account_id,transaction_group,type,amount,balance_after,description) VALUES(?,?,?,?,?,?,?)`).bind(uid(),incoming.account_id,group,'refund_debit',amount,Number(incoming.recipient_balance)-amount,`Reversal of transfer ${original.id}`));
-    }
-    try {
-      await env.DB.batch(batch);
-    } catch(e) {
-      const dup=await env.DB.prepare('SELECT refund_reference,amount FROM transaction_refunds WHERE idempotency_key=?').bind(idem).first();
-      if(dup)return response({ok:true,duplicate:true,reference:dup.refund_reference,amount:dup.amount/100},200,request);
-      throw e;
-    }
-    await audit(env,user,'transaction_refund_processed','transaction_refund',refundId,{originalLedgerId:original.id,amount,reason,adminNote:note,reference:ref});
-    await notify(env,original.user_id,'NovaBank refund processed',`N₹${(amount/100).toFixed(2)} refund credited. Reference ${ref}.`);
-    return response({ok:true,message:'Refund processed and credited to customer account.',reference:ref,amount:amount/100,balance:newBalance/100},200,request);
   }
 
   if (method === "GET" && path === "/api/admin/treasury") {
@@ -1636,7 +1579,7 @@ async function route(request, env) {
     await postTreasury(env,user,"internal_transfer",0,`Internal demo transfer · ${source.account_number} → ${dest.account_number}`,"transaction",group,group);
     await audit(env, user, "demo_transfer", "transaction", group, { amount, from: source.id, to: dest.id });
     await notify(env, dest.user_id, "Money received", `N₹${(amount/100).toFixed(2)} demo transfer received.`);
-    return response({ ok: true, status: "SUCCESS", message: "Demo transfer completed successfully.", transactionId: group, reference: group, amount: amount / 100, fee: 0, totalDebit: amount / 100 }, 200, request);
+    return response({ ok: true, message: "Demo transfer submitted.", transactionId: group }, 200, request);
   }
   if (method === "GET" && path === "/api/application-track") {
     await ensureApplicationTracking(env);
@@ -2237,7 +2180,13 @@ export default {
   async fetch(request, env) {
     try { return await route(request, env); }
     catch (e) {
-      // Do not expose database details or stack traces to clients.
+      // Keep the detailed cause in Cloudflare Worker logs; never expose SQL or secrets to clients.
+      console.error("NovaBank Worker request failed", {
+        method: request.method,
+        path: new URL(request.url).pathname,
+        error: String(e?.message || e),
+        stack: e?.stack || ""
+      });
       return new Response(JSON.stringify({ error: "Unexpected server error. Check Worker logs." }), { status: 500, headers: { "content-type": "application/json", "cache-control": "no-store", "x-content-type-options":"nosniff", "referrer-policy":"no-referrer", "x-frame-options":"DENY", ...corsHeaders(request) } });
     }
   }
